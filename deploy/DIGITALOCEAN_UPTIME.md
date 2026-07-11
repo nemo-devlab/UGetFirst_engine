@@ -38,6 +38,16 @@ Optional `.env`:
 ```env
 HEALTH_PORT=8080
 HEALTH_TOKEN=long-random-string   # append ?token=... to monitor URL
+ENGINE_ADMIN_TOKEN=long-random-string   # admin dashboard restart + JSON health
+```
+
+Admin dashboard (`UGetFirst_admin`) uses `ENGINE_HEALTH_URL` and `ENGINE_ADMIN_TOKEN`
+to read status and `POST /admin/restart`. Install passwordless sudo once:
+
+```bash
+sudo cp deploy/sudoers-ugetfirst-engine /etc/sudoers.d/ugetfirst-engine
+sudo chmod 440 /etc/sudoers.d/ugetfirst-engine
+sudo visudo -cf /etc/sudoers.d/ugetfirst-engine
 ```
 
 ## Verify

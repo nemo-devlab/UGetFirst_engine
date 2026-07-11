@@ -12,6 +12,9 @@ git pull
 echo "==> install health + engine systemd units"
 sudo cp deploy/ugetfirst-health.service /etc/systemd/system/
 sudo cp deploy/ugetfirst-engine.service /etc/systemd/system/
+sudo cp deploy/sudoers-ugetfirst-engine /etc/sudoers.d/ugetfirst-engine
+sudo chmod 440 /etc/sudoers.d/ugetfirst-engine
+sudo visudo -cf /etc/sudoers.d/ugetfirst-engine
 sudo systemctl daemon-reload
 sudo systemctl enable ugetfirst-health ugetfirst-engine
 sudo systemctl restart ugetfirst-health

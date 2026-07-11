@@ -3,11 +3,16 @@
 The engine writes a heartbeat file after each successful cycle. A separate
 `ugetfirst-health.service` (or the embedded server) reads it and exposes
 GET /health on HEALTH_PORT (default 8080).
+
+POST /admin/restart restarts ugetfirst-engine (token required). Install
+deploy/sudoers-ugetfirst-engine on the VPS for passwordless restart.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import subprocess
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -62,8 +67,15 @@ def is_healthy() -> bool:
     return since <= stale_after
 
 
+def _admin_token() -> str:
+    return (
+        os.getenv("ENGINE_ADMIN_TOKEN", "").strip()
+        or os.getenv("HEALTH_TOKEN", "").strip()
+    )
+
+
 def _authorized(path: str, headers: dict[str, str]) -> bool:
-    token = os.getenv("HEALTH_TOKEN", "").strip()
+    token = _admin_token()
     if not token:
         return True
     parsed = urlparse(path)
@@ -75,29 +87,89 @@ def _authorized(path: str, headers: dict[str, str]) -> bool:
         return True
     if headers.get("X-Health-Token") == token:
         return True
+    if headers.get("X-Engine-Admin-Token") == token:
+        return True
     return False
 
 
+def health_payload() -> dict[str, object]:
+    """Serializable health snapshot for /health and admin dashboards."""
+    healthy = is_healthy()
+    since = _seconds_since_success()
+    last = _last_success_at()
+    return {
+        "status": "ok" if healthy else "stale",
+        "healthy": healthy,
+        "env": config.ENV,
+        "last_success_at": last.isoformat() if last else None,
+        "last_success_seconds_ago": round(since, 1) if since is not None else None,
+        "stale_after_seconds": config.MIN_INTERVAL_SECONDS * 2.5,
+    }
+
+
+def restart_engine_service() -> tuple[bool, str]:
+    """Restart the scraper systemd unit (requires passwordless sudo on VPS)."""
+    try:
+        proc = subprocess.run(
+            ["sudo", "systemctl", "restart", "ugetfirst-engine"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "restart timed out after 30s"
+    except OSError as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "systemctl failed").strip()
+        return False, detail[:500]
+    return True, "ugetfirst-engine restarted"
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
+    def _header_map(self) -> dict[str, str]:
+        return {k: v for k, v in self.headers.items()}
+
+    def _send_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
-        if not _authorized(self.path, {k: v for k, v in self.headers.items()}):
+        if not _authorized(self.path, self._header_map()):
             self.send_response(401)
             self.end_headers()
             self.wfile.write(b"unauthorized\n")
             return
 
-        route = urlparse(self.path).path.rstrip("/") or "/"
+        parsed = urlparse(self.path)
+        route = parsed.path.rstrip("/") or "/"
         if route not in ("/", "/health"):
             self.send_response(404)
             self.end_headers()
             self.wfile.write(b"not found\n")
             return
 
-        healthy = is_healthy()
-        since = _seconds_since_success()
+        payload = health_payload()
+        query = parse_qs(parsed.query)
+        wants_json = (
+            "json" in query.get("format", [])
+            or "application/json" in self.headers.get("Accept", "")
+        )
+        if wants_json:
+            status = 200 if payload["healthy"] else 503
+            self._send_json(status, payload)
+            return
+
+        healthy = bool(payload["healthy"])
+        since = payload["last_success_seconds_ago"]
         body = (
-            f"status={'ok' if healthy else 'stale'}\n"
-            f"env={config.ENV}\n"
+            f"status={payload['status']}\n"
+            f"env={payload['env']}\n"
             f"last_success_seconds_ago={since if since is not None else 'pending'}\n"
         ).encode()
         self.send_response(200 if healthy else 503)
@@ -105,6 +177,24 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        if not _authorized(self.path, self._header_map()):
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+
+        route = urlparse(self.path).path.rstrip("/") or "/"
+        if route != "/admin/restart":
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+
+        ok, message = restart_engine_service()
+        if ok:
+            log.info("Admin restart: %s", message)
+            self._send_json(200, {"ok": True, "message": message})
+            return
+        log.warning("Admin restart failed: %s", message)
+        self._send_json(500, {"ok": False, "error": message})
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         return
