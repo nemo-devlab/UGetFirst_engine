@@ -21,6 +21,8 @@ WEB_MIGRATIONS = ROOT.parent / "UGetFirst_web" / "supabase" / "migrations"
 
 MIGRATIONS = [
     ("both", WEB_MIGRATIONS / "012_sms_sendouts.sql"),
+    ("both", WEB_MIGRATIONS / "013_engine_runs.sql"),
+    ("both", WEB_MIGRATIONS / "014_facebook_groups_curation.sql"),
     ("prod", WEB_MIGRATIONS / "013_drop_dev_schema.sql"),
 ]
 

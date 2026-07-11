@@ -6,28 +6,14 @@ item into a small, stable Post shape the rest of the app relies on.
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass
 
 from apify_client import ApifyClient
 
 import config
+from groups import group_id
 
 log = logging.getLogger("ugetfirst.scraper")
-
-_GROUP_ID_RE = re.compile(r"/groups/(\d+)")
-
-
-def group_id(url_or_id: str | None) -> str | None:
-    """Extract the numeric group id from a URL (or return digits as-is).
-    Used to match a scraped post back to a monitored group_url robustly,
-    regardless of URL formatting differences."""
-    if not url_or_id:
-        return None
-    m = _GROUP_ID_RE.search(url_or_id)
-    if m:
-        return m.group(1)
-    return url_or_id if url_or_id.isdigit() else None
 
 
 @dataclass
@@ -35,6 +21,12 @@ class Post:
     url: str
     text: str
     group_id: str | None
+
+
+@dataclass
+class ScrapeResult:
+    posts: list[Post]
+    apify_run_id: str | None
 
 
 # Actor output field names can vary; check these in order. Confirmed against a
@@ -71,7 +63,13 @@ def _dataset_id(run) -> str:
     raise TypeError(f"Unexpected Apify run result type: {type(run)!r}")
 
 
-def scrape(group_urls: list[str], dump_raw_keys: bool = False) -> list[Post]:
+def _run_id(run) -> str | None:
+    if isinstance(run, dict):
+        return run.get("id")
+    return getattr(run, "id", None)
+
+
+def scrape(group_urls: list[str], dump_raw_keys: bool = False) -> ScrapeResult:
     """Scrape recent posts for the given group URLs via one actor run.
 
     Fetches posts within the LOOKBACK time window (newest-first, capped at
@@ -79,7 +77,7 @@ def scrape(group_urls: list[str], dump_raw_keys: bool = False) -> list[Post]:
     on notification_logs to avoid re-notifying for posts we've already seen.
     """
     if not group_urls:
-        return []
+        return ScrapeResult(posts=[], apify_run_id=None)
     if not config.APIFY_TOKEN:
         raise RuntimeError("APIFY_TOKEN is not set; cannot scrape.")
 
@@ -109,4 +107,4 @@ def scrape(group_urls: list[str], dump_raw_keys: bool = False) -> list[Post]:
         if post:
             posts.append(post)
     log.info("Scraped %d normalized post(s)", len(posts))
-    return posts
+    return ScrapeResult(posts=posts, apify_run_id=_run_id(run))

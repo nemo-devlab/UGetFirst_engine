@@ -30,6 +30,7 @@ if str(ROOT) not in sys.path:
 from supabase import Client, create_client  # noqa: E402
 
 import config  # noqa: E402
+import groups  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -113,9 +114,24 @@ def main() -> None:
     dev.schema("public").table("facebook_groups").delete().neq(
         "id", "00000000-0000-0000-0000-000000000000"
     ).execute()
-    catalog_rows = [
-        {"name": name, "group_url": url, "active": True} for name, url in FACEBOOK_GROUPS
-    ]
+    catalog_rows = []
+    monitored: list[dict] = []
+    for name, url in FACEBOOK_GROUPS:
+        normalized = groups.normalize_group_url(url)
+        if not normalized:
+            raise SystemExit(f"Invalid catalog URL: {url}")
+        catalog_rows.append(
+            {
+                "name": name,
+                "group_url": normalized["canonical_url"],
+                "canonical_url": normalized["canonical_url"],
+                "facebook_group_id": normalized["facebook_group_id"],
+                "discovery_source": "manual",
+                "review_status": "approved",
+                "active": True,
+            }
+        )
+
     dev.schema("public").table("facebook_groups").insert(catalog_rows).execute()
     log.info("Inserted %d facebook_groups catalog row(s)", len(catalog_rows))
 
@@ -124,10 +140,19 @@ def main() -> None:
         "id", "00000000-0000-0000-0000-000000000000"
     ).execute()
 
-    monitored: list[dict] = []
     for sid in subscriber_ids:
-        for url in group_urls:
-            monitored.append({"subscriber_id": sid, "group_url": url})
+        for name, url in FACEBOOK_GROUPS:
+            normalized = groups.normalize_group_url(url)
+            if not normalized:
+                continue
+            monitored.append(
+                {
+                    "subscriber_id": sid,
+                    "group_url": normalized["canonical_url"],
+                    "facebook_group_id": normalized["facebook_group_id"],
+                    "group_name": name,
+                }
+            )
 
     for i in range(0, len(monitored), 100):
         dev.schema("public").table("monitored_groups").insert(monitored[i : i + 100]).execute()
