@@ -1,5 +1,5 @@
 [Unit]
-Description=UGetFirst scraping/notification engine
+Description=UGetFirst engine HTTP health check (/health on port 8080)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,9 +9,9 @@ User=ugetfirst
 Group=ugetfirst
 WorkingDirectory=/home/ugetfirst/UGetFirst_engine
 EnvironmentFile=/home/ugetfirst/UGetFirst_engine/.env
-ExecStart=/home/ugetfirst/UGetFirst_engine/.venv/bin/python main.py
+ExecStart=/home/ugetfirst/UGetFirst_engine/.venv/bin/python health_server.py
 Restart=always
-RestartSec=15
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target

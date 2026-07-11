@@ -1,38 +1,56 @@
 """Minimal HTTP health endpoint for external uptime monitors (e.g. DigitalOcean).
 
-Returns 200 while the engine loop is completing cycles on schedule.
-Returns 503 when the last successful cycle is too old (likely stuck or crashed).
+The engine writes a heartbeat file after each successful cycle. A separate
+`ugetfirst-health.service` (or the embedded server) reads it and exposes
+GET /health on HEALTH_PORT (default 8080).
 """
 from __future__ import annotations
 
 import logging
 import os
-import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import config
 
 log = logging.getLogger("ugetfirst.health")
 
-_started_at = datetime.now(timezone.utc)
-_last_success_at: datetime | None = None
-_lock = threading.Lock()
+HEARTBEAT_PATH = Path(__file__).resolve().parent / ".engine-heartbeat"
+
+
+def _write_heartbeat(at: datetime) -> None:
+    HEARTBEAT_PATH.write_text(at.isoformat(), encoding="utf-8")
+
+
+def mark_engine_started() -> None:
+    """Call when the 24/7 loop begins (before the first cycle completes)."""
+    _write_heartbeat(datetime.now(timezone.utc))
 
 
 def mark_cycle_success() -> None:
     """Call after each engine cycle finishes without raising."""
-    global _last_success_at
-    with _lock:
-        _last_success_at = datetime.now(timezone.utc)
+    _write_heartbeat(datetime.now(timezone.utc))
+
+
+def _last_success_at() -> datetime | None:
+    try:
+        raw = HEARTBEAT_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    return datetime.fromisoformat(raw)
 
 
 def _seconds_since_success() -> float | None:
-    with _lock:
-        if _last_success_at is None:
-            return None
-        return (datetime.now(timezone.utc) - _last_success_at).total_seconds()
+    last = _last_success_at()
+    if last is None:
+        return None
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - last).total_seconds()
 
 
 def is_healthy() -> bool:
@@ -40,10 +58,7 @@ def is_healthy() -> bool:
     stale_after = config.MIN_INTERVAL_SECONDS * 2.5
     since = _seconds_since_success()
     if since is None:
-        # Grace period while the first cycle runs (Apify can take ~30s+).
-        startup_grace = config.MIN_INTERVAL_SECONDS * 3
-        age = (datetime.now(timezone.utc) - _started_at).total_seconds()
-        return age <= startup_grace
+        return False
     return since <= stale_after
 
 
@@ -95,9 +110,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
         return
 
 
-def start_health_server() -> None:
+def run_health_server() -> None:
+    """Block forever serving /health (for ugetfirst-health.service)."""
     port = int(os.getenv("HEALTH_PORT", "8080"))
     server = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True, name="health-http")
-    thread.start()
     log.info("Health server listening on 0.0.0.0:%d (/health)", port)
+    server.serve_forever()

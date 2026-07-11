@@ -102,7 +102,7 @@ def main() -> None:
         run_cycle(dump_raw_keys=args.dump_raw_keys)
         return
 
-    health.start_health_server()
+    health.mark_engine_started()
 
     while True:
         start = time.monotonic()

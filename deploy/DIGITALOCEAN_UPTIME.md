@@ -1,78 +1,65 @@
 # DigitalOcean uptime monitoring
 
-The engine exposes a plain HTTP health endpoint for external monitors. **Do not use
-PING alone** — it only confirms the droplet is reachable, not that the scraper
-loop is running.
+Use **HTTP** (not PING) against `/health`. PING only confirms the droplet is up.
 
-## Health endpoint
+## Architecture
 
-When `python main.py` runs under systemd (not `--once`), it listens on:
+| Service | Role |
+|---|---|
+| `ugetfirst-engine.service` | Scraper loop; writes `.engine-heartbeat` after each successful cycle |
+| `ugetfirst-health.service` | Always listens on `:8080`, serves `GET /health` |
 
+Splitting health into its own service means port 8080 stays up across engine deploys/restarts.
+
+## One-time VPS setup
+
+SSH into the droplet and run:
+
+```bash
+cd ~/UGetFirst_engine
+git pull
+bash scripts/vps-setup-health.sh
 ```
-http://<droplet-ip>:8080/health
+
+That script installs both systemd units, opens UFW port 8080, and restarts services.
+
+**Also check DigitalOcean cloud firewall:** Networking → Firewalls → allow **Inbound TCP 8080** to the droplet (UFW alone is not enough if a DO firewall is attached).
+
+## DO uptime check
+
+1. **Monitoring → Uptime → Create**
+2. **Type:** HTTP
+3. **URL:** `http://157.230.234.67:8080/health`
+4. **Expected status:** 200
+5. **Interval:** 1 minute
+
+Optional `.env`:
+
+```env
+HEALTH_PORT=8080
+HEALTH_TOKEN=long-random-string   # append ?token=... to monitor URL
+```
+
+## Verify
+
+```bash
+sudo systemctl status ugetfirst-health ugetfirst-engine
+curl -i http://127.0.0.1:8080/health
+curl -i http://157.230.234.67:8080/health   # from your laptop
 ```
 
 | Response | Meaning |
 |---|---|
-| `200` + `status=ok` | Last cycle finished within ~5 minutes (2.5× 120s interval) |
-| `503` + `status=stale` | Engine stuck, crashed, or cycles failing repeatedly |
-| `401` | Wrong/missing token (only if `HEALTH_TOKEN` is set) |
+| `200 status=ok` | Engine completed a cycle recently |
+| `503 status=stale` | Engine stuck or not running |
+| Connection refused | `ugetfirst-health` down or firewall blocking 8080 |
 
-Optional env vars in `.env`:
+## Troubleshooting
 
-```env
-HEALTH_PORT=8080
-HEALTH_TOKEN=choose-a-long-random-string
-```
-
-If `HEALTH_TOKEN` is set, append `?token=...` to the monitor URL or send header
-`X-Health-Token: ...`.
-
-## 1. Open the port on the droplet
+**Alert firing but engine runs:** the running `ugetfirst-engine` process was started before a deploy — restart both services:
 
 ```bash
-sudo ufw allow OpenSSH
-sudo ufw allow 8080/tcp
-sudo ufw enable
-sudo ufw status
+sudo systemctl restart ugetfirst-engine ugetfirst-health
 ```
 
-## 2. Create the uptime check in DigitalOcean
-
-1. **Monitoring → Uptime → Create Uptime Check**
-2. **Type:** HTTP (HTTPS optional — see below)
-3. **URL:** `http://157.230.234.67:8080/health`
-   - With token: `http://157.230.234.67:8080/health?token=YOUR_TOKEN`
-4. **Regions:** pick 2–3 (e.g. NYC, SF, AMS)
-5. **Check interval:** 1 minute
-6. **Alert policy:** email/SMS/Slack when check fails
-7. **Advanced (if available):**
-   - Expected status code: **200**
-   - Treat 503 as down (default for failed HTTP checks)
-
-## PING vs HTTP
-
-| Check | Detects |
-|---|---|
-| **PING** | Droplet powered on / network reachable |
-| **HTTP /health** | Engine loop completing cycles on schedule |
-
-Use **HTTP** for the engine. Keep PING only if you also want bare-metal alerts.
-
-## HTTPS (optional)
-
-DO uptime supports HTTPS. Options:
-
-- Point a subdomain (e.g. `engine-health.yourdomain.com`) at the droplet, put
-  **Caddy/nginx** in front, terminate TLS, proxy to `127.0.0.1:8080`.
-- Or stay on **HTTP** for an internal ops URL — acceptable for a non-public
-  health port with `HEALTH_TOKEN` set.
-
-## Verify manually
-
-```bash
-curl -i http://127.0.0.1:8080/health
-curl -i "http://127.0.0.1:8080/health?token=YOUR_TOKEN"   # if HEALTH_TOKEN set
-```
-
-After deploy + systemd restart, confirm `status=ok` and create the DO check.
+**Works locally on VPS (`curl 127.0.0.1`) but not externally:** open **DO cloud firewall** port 8080 and/or `sudo ufw allow 8080/tcp`.
