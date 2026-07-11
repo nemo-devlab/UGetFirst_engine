@@ -47,12 +47,35 @@ def run_cycle(dump_raw_keys: bool = False) -> None:
             if not keyword:
                 continue
             # Idempotency guard: only proceed if this row is newly inserted.
-            if not db.log_notification(sub.id, post.url, keyword):
+            notification_log_id = db.log_notification(sub.id, post.url, keyword)
+            if not notification_log_id:
                 continue
+            body = notifier.build_message(keyword, post.url)
             if sub.notify_sms and sub.phone:
                 notifier.send(sub.phone, keyword, post.url)
+                db.log_sendout(
+                    subscriber_id=sub.id,
+                    notification_log_id=notification_log_id,
+                    phone=sub.phone,
+                    body=body,
+                    keyword=keyword,
+                    post_url=post.url,
+                    channel="simulated",
+                    status="sent",
+                )
                 sent += 1
             else:
+                db.log_sendout(
+                    subscriber_id=sub.id,
+                    notification_log_id=notification_log_id,
+                    phone=sub.phone or "",
+                    body=body,
+                    keyword=keyword,
+                    post_url=post.url,
+                    channel="simulated",
+                    status="skipped",
+                    error="notify_sms off or no phone",
+                )
                 log.info("Logged match for %s but SMS suppressed (opt-out/no phone)", sub.id)
     log.info("Cycle complete: %d post(s), %d SMS dispatched.", len(posts), sent)
 
@@ -67,8 +90,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    log.info("Starting engine (ENV=%s, schema=%s, sms=SIMULATED->outbox/)",
-             config.ENV, config.DB_SCHEMA)
+    log.info(
+        "Starting engine (ENV=%s, project=%s, schema=%s, sms=SIMULATED->outbox/)",
+        config.ENV,
+        config.SUPABASE_URL,
+        config.DB_SCHEMA,
+    )
 
     if args.once:
         run_cycle(dump_raw_keys=args.dump_raw_keys)

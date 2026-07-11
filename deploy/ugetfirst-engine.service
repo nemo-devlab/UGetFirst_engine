@@ -1,0 +1,16 @@
+[Unit]
+Description=UGetFirst scraping/notification engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/UGetFirst_engine
+EnvironmentFile=/opt/UGetFirst_engine/.env
+ExecStart=/opt/UGetFirst_engine/.venv/bin/python main.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
