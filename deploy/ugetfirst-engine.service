@@ -6,9 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/UGetFirst_engine
-EnvironmentFile=/opt/UGetFirst_engine/.env
-ExecStart=/opt/UGetFirst_engine/.venv/bin/python main.py
+WorkingDirectory=/home/ugetfirst/UGetFirst_engine
+EnvironmentFile=/home/ugetfirst/UGetFirst_engine/.env
+ExecStart=/home/ugetfirst/UGetFirst_engine/.venv/bin/python main.py
 Restart=always
 RestartSec=15
 
