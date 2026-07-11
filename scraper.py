@@ -61,6 +61,16 @@ def _normalize(item: dict) -> Post | None:
     return Post(url=url, text=text, group_id=gid)
 
 
+def _dataset_id(run) -> str:
+    """Apify client v1 returns a dict; v3 returns a Run model with snake_case fields."""
+    if isinstance(run, dict):
+        return run["defaultDatasetId"]
+    dataset_id = getattr(run, "default_dataset_id", None)
+    if dataset_id:
+        return dataset_id
+    raise TypeError(f"Unexpected Apify run result type: {type(run)!r}")
+
+
 def scrape(group_urls: list[str], dump_raw_keys: bool = False) -> list[Post]:
     """Scrape recent posts for the given group URLs via one actor run.
 
@@ -91,7 +101,7 @@ def scrape(group_urls: list[str], dump_raw_keys: bool = False) -> list[Post]:
     run = apify.actor(config.APIFY_ACTOR_ID).call(run_input=run_input)
 
     posts: list[Post] = []
-    dataset_id = run["defaultDatasetId"]
+    dataset_id = _dataset_id(run)
     for item in apify.dataset(dataset_id).iterate_items():
         if dump_raw_keys:
             log.info("Raw item keys: %s", sorted(item.keys()))
