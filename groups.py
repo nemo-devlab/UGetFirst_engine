@@ -27,6 +27,12 @@ def group_id(url_or_id: str | None) -> str | None:
     return url_or_id if url_or_id.isdigit() else None
 
 
+def is_placeholder_group_name(name: str | None, facebook_group_id: str) -> bool:
+    if not name or not name.strip():
+        return True
+    return name.strip() == f"Facebook Group {facebook_group_id}"
+
+
 def canonical_url(facebook_group_id: str) -> str:
     return f"https://www.facebook.com/groups/{facebook_group_id}"
 
@@ -124,8 +130,11 @@ def upsert_catalog_group(
         payload["name"] = name
 
     if row:
-        update_payload = {k: v for k, v in payload.items() if k != "name" or not row.get("name")}
-        if name and not row.get("name"):
+        update_payload = {k: v for k, v in payload.items() if k != "name"}
+        existing_name = (row.get("name") or "").strip()
+        if name and (
+            not existing_name or is_placeholder_group_name(existing_name, facebook_group_id)
+        ):
             update_payload["name"] = name
         updated = table.update(update_payload).eq("id", row["id"]).execute()
         return updated.data[0] if updated.data else row
@@ -161,9 +170,13 @@ def resolve_catalog_group(
     )
     existing_rows = existing.data or []
     cached_name = existing_rows[0].get("name") if existing_rows else None
-    name = cached_name
+    name = (
+        cached_name
+        if cached_name and not is_placeholder_group_name(cached_name, gid)
+        else None
+    )
 
-    if fetch_if_missing and not cached_name:
+    if fetch_if_missing and not name:
         metadata = fetch_group_metadata(curl)
         name = metadata.name
 

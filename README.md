@@ -16,6 +16,7 @@ loop (every MIN_INTERVAL_SECONDS, non-overlapping):
   3. for each post, case-insensitively match keywords  (matcher.py)
   4. INSERT notification_logs (unique subscriber_id, post_url)  -> idempotency
   5. if newly inserted AND notify_sms: send SMS + log sms_sendouts (notifier.py)
+  6. log cycle metrics to engine_runs (posts_scraped, matches_found, apify_run_id)
 ```
 
 - **Dedup / idempotency:** the unique `(subscriber_id, post_url)` constraint on
@@ -68,6 +69,14 @@ Required for the active `ENV`: that project's URL + service-role key, plus
 `outbox/` and inserts a row into `sms_sendouts` (full message body for the admin
 Sendouts page). Apply `../UGetFirst_web/supabase/migrations/012_sms_sendouts.sql`
 on **both** Supabase projects before running the engine.
+
+Each cycle also writes one row to `engine_runs` (`posts_scraped`, `matches_found`,
+`sms_dispatched`, `apify_run_id`). Apply
+`../UGetFirst_web/supabase/migrations/013_engine_runs.sql` on both projects, or:
+
+```bash
+PROD_DATABASE_URL=... DEV_DATABASE_URL=... python scripts/apply_remote_migrations.py --apply
+```
 
 ## Run
 

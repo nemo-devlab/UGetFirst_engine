@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from supabase import Client, create_client
 
@@ -127,5 +128,64 @@ def log_sendout(
     except Exception as exc:
         if "42P01" in str(exc) or "sms_sendouts" in str(exc).lower():
             log.warning("sms_sendouts table missing; run migration 012_sms_sendouts.sql")
+            return
+        raise
+
+
+def _engine_runs_missing(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "42p01" in msg or "engine_runs" in msg or "pgrst205" in msg
+
+
+def start_engine_run(groups_count: int) -> str | None:
+    """Insert a cycle-start row. Returns run id, or None if engine_runs is missing."""
+    try:
+        result = (
+            _table("engine_runs")
+            .insert(
+                {
+                    "env": config.ENV,
+                    "groups_count": groups_count,
+                }
+            )
+            .execute()
+        )
+        if result.data:
+            return result.data[0]["id"]
+        return None
+    except Exception as exc:
+        if _engine_runs_missing(exc):
+            log.warning("engine_runs table missing; run migration 013_engine_runs.sql")
+            return None
+        raise
+
+
+def finish_engine_run(
+    run_id: str | None,
+    *,
+    posts_scraped: int = 0,
+    matches_found: int = 0,
+    sms_dispatched: int = 0,
+    apify_run_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    """Update a cycle row with scrape/match/SMS metrics (and optional error)."""
+    if not run_id:
+        return
+    row: dict = {
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "posts_scraped": posts_scraped,
+        "matches_found": matches_found,
+        "sms_dispatched": sms_dispatched,
+    }
+    if apify_run_id:
+        row["apify_run_id"] = apify_run_id
+    if error:
+        row["error"] = error[:2000]
+    try:
+        _table("engine_runs").update(row).eq("id", run_id).execute()
+    except Exception as exc:
+        if _engine_runs_missing(exc):
+            log.warning("engine_runs table missing; run migration 013_engine_runs.sql")
             return
         raise

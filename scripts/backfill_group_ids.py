@@ -114,7 +114,7 @@ def main() -> None:
             if not normalized:
                 continue
             name = (row.get("name") or "").strip()
-            if name and not name.startswith("Facebook Group "):
+            if name and not groups.is_placeholder_group_name(name, normalized["facebook_group_id"]):
                 continue
             groups.resolve_catalog_group(
                 client(),

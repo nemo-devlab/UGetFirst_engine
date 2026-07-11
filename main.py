@@ -25,60 +25,97 @@ log = logging.getLogger("ugetfirst")
 
 
 def run_cycle(dump_raw_keys: bool = False) -> None:
-    by_group = db.load_monitoring()
-    if not by_group:
-        log.info("No monitored groups with keywords; nothing to do.")
-        return
-
-    group_urls = list(by_group.keys())
-    # Index subscribers by numeric group id for robust post -> group matching.
-    subs_by_gid: dict[str, list[db.Subscriber]] = {}
-    for url, subs in by_group.items():
-        gid = group_id(url)
-        if gid:
-            subs_by_gid.setdefault(gid, []).extend(subs)
-
-    posts = scrape(group_urls, dump_raw_keys=dump_raw_keys)
-
+    run_id: str | None = None
+    posts_scraped = 0
+    matches_found = 0
     sent = 0
-    for post in posts:
-        subs = subs_by_gid.get(post.group_id or "", [])
-        for sub in subs:
-            keyword = matcher.first_match(post.text, sub.keywords)
-            if not keyword:
-                continue
-            # Idempotency guard: only proceed if this row is newly inserted.
-            notification_log_id = db.log_notification(sub.id, post.url, keyword)
-            if not notification_log_id:
-                continue
-            body = notifier.build_message(keyword, post.url)
-            if sub.notify_sms and sub.phone:
-                notifier.send(sub.phone, keyword, post.url)
-                db.log_sendout(
-                    subscriber_id=sub.id,
-                    notification_log_id=notification_log_id,
-                    phone=sub.phone,
-                    body=body,
-                    keyword=keyword,
-                    post_url=post.url,
-                    channel="simulated",
-                    status="sent",
-                )
-                sent += 1
-            else:
-                db.log_sendout(
-                    subscriber_id=sub.id,
-                    notification_log_id=notification_log_id,
-                    phone=sub.phone or "",
-                    body=body,
-                    keyword=keyword,
-                    post_url=post.url,
-                    channel="simulated",
-                    status="skipped",
-                    error="notify_sms off or no phone",
-                )
-                log.info("Logged match for %s but SMS suppressed (opt-out/no phone)", sub.id)
-    log.info("Cycle complete: %d post(s), %d SMS dispatched.", len(posts), sent)
+    apify_run_id: str | None = None
+
+    try:
+        by_group = db.load_monitoring()
+        if not by_group:
+            log.info("No monitored groups with keywords; nothing to do.")
+            run_id = db.start_engine_run(0)
+            db.finish_engine_run(run_id)
+            return
+
+        group_urls = list(by_group.keys())
+        run_id = db.start_engine_run(len(group_urls))
+
+        # Index subscribers by numeric group id for robust post -> group matching.
+        subs_by_gid: dict[str, list[db.Subscriber]] = {}
+        for url, subs in by_group.items():
+            gid = group_id(url)
+            if gid:
+                subs_by_gid.setdefault(gid, []).extend(subs)
+
+        scrape_result = scrape(group_urls, dump_raw_keys=dump_raw_keys)
+        posts = scrape_result.posts
+        apify_run_id = scrape_result.apify_run_id
+        posts_scraped = len(posts)
+
+        for post in posts:
+            subs = subs_by_gid.get(post.group_id or "", [])
+            for sub in subs:
+                keyword = matcher.first_match(post.text, sub.keywords)
+                if not keyword:
+                    continue
+                # Idempotency guard: only proceed if this row is newly inserted.
+                notification_log_id = db.log_notification(sub.id, post.url, keyword)
+                if not notification_log_id:
+                    continue
+                matches_found += 1
+                body = notifier.build_message(keyword, post.url)
+                if sub.notify_sms and sub.phone:
+                    notifier.send(sub.phone, keyword, post.url)
+                    db.log_sendout(
+                        subscriber_id=sub.id,
+                        notification_log_id=notification_log_id,
+                        phone=sub.phone,
+                        body=body,
+                        keyword=keyword,
+                        post_url=post.url,
+                        channel="simulated",
+                        status="sent",
+                    )
+                    sent += 1
+                else:
+                    db.log_sendout(
+                        subscriber_id=sub.id,
+                        notification_log_id=notification_log_id,
+                        phone=sub.phone or "",
+                        body=body,
+                        keyword=keyword,
+                        post_url=post.url,
+                        channel="simulated",
+                        status="skipped",
+                        error="notify_sms off or no phone",
+                    )
+                    log.info("Logged match for %s but SMS suppressed (opt-out/no phone)", sub.id)
+        log.info(
+            "Cycle complete: %d post(s) scraped, %d new match(es), %d SMS dispatched.",
+            posts_scraped,
+            matches_found,
+            sent,
+        )
+    except Exception as exc:
+        db.finish_engine_run(
+            run_id,
+            posts_scraped=posts_scraped,
+            matches_found=matches_found,
+            sms_dispatched=sent,
+            apify_run_id=apify_run_id,
+            error=str(exc),
+        )
+        raise
+    else:
+        db.finish_engine_run(
+            run_id,
+            posts_scraped=posts_scraped,
+            matches_found=matches_found,
+            sms_dispatched=sent,
+            apify_run_id=apify_run_id,
+        )
 
 
 def main() -> None:
