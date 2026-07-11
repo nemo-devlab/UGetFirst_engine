@@ -12,6 +12,7 @@ import time
 
 import config
 import db
+import health
 import matcher
 import notifier
 from scraper import group_id, scrape
@@ -101,10 +102,13 @@ def main() -> None:
         run_cycle(dump_raw_keys=args.dump_raw_keys)
         return
 
+    health.start_health_server()
+
     while True:
         start = time.monotonic()
         try:
             run_cycle(dump_raw_keys=args.dump_raw_keys)
+            health.mark_cycle_success()
         except Exception:
             log.exception("Cycle failed; will retry next interval.")
         elapsed = time.monotonic() - start

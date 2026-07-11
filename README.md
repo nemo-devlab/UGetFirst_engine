@@ -78,7 +78,7 @@ python main.py --once --dump-raw-keys
 # one cycle
 python main.py --once
 
-# continuous 24/7 loop
+# continuous 24/7 loop (HTTP health on :8080 — see deploy/DIGITALOCEAN_UPTIME.md)
 python main.py
 ```
 
