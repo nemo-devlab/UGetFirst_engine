@@ -1,3 +1,4 @@
 apify-client>=1.7.0
 supabase>=2.6.0
 python-dotenv>=1.0.1
+twilio>=9.0.0

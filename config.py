@@ -62,11 +62,35 @@ DEV_SUPABASE_SERVICE_ROLE_KEY = os.getenv("DEV_SUPABASE_SERVICE_ROLE_KEY", "")
 APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")
 APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "apify/facebook-groups-scraper")
 
-# SMS is simulated for now: the notifier writes one .txt file per message into
-# outbox/. A real provider will be added once 10DLC registration clears.
+# SMS: "simulated" (outbox/) or "twilio". Twilio also requires TWILIO_* below.
+_sms_mode = os.getenv("SMS_MODE", "").strip().lower()
+if _sms_mode in ("simulated", "twilio"):
+    SMS_MODE = _sms_mode
+else:
+    # Default: twilio when creds present, else simulated.
+    SMS_MODE = (
+        "twilio"
+        if (
+            os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+            and os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+            and os.getenv("TWILIO_FROM_NUMBER", "").strip()
+        )
+        else "simulated"
+    )
 
-MIN_INTERVAL_SECONDS = int(os.getenv("MIN_INTERVAL_SECONDS", "120"))
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "").strip()
+# Shared secret for inbound STOP/HELP webhook (optional but recommended).
+TWILIO_WEBHOOK_AUTH_TOKEN = os.getenv("TWILIO_WEBHOOK_AUTH_TOKEN", "").strip() or TWILIO_AUTH_TOKEN
+
+MIN_INTERVAL_SECONDS = int(os.getenv("MIN_INTERVAL_SECONDS", "600"))
+# Per-group post cap. Total resultsLimit for an Apify run = max(RESULTS_LIMIT, groups * RESULTS_PER_GROUP).
 RESULTS_LIMIT = int(os.getenv("RESULTS_LIMIT", "20"))
+RESULTS_PER_GROUP = int(os.getenv("RESULTS_PER_GROUP", "10"))
+# Max groups per Apify actor call (batches when catalog is large).
+SCRAPE_BATCH_SIZE = int(os.getenv("SCRAPE_BATCH_SIZE", "25"))
+APIFY_MAX_RETRIES = int(os.getenv("APIFY_MAX_RETRIES", "1"))
 
 # Time-based scrape window passed to the actor's `onlyPostsNewerThan`.
 # Prefer LOOKBACK ("10 minutes", "1 day"). LOOKBACK_MINUTES is accepted as a
