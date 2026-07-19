@@ -33,17 +33,58 @@ class Subscriber:
     id: str
     phone: str | None
     notify_sms: bool
+    sms_consent_at: str | None = None
     keywords: list[str] = field(default_factory=list)
+
+    @property
+    def sms_enabled(self) -> bool:
+        """SMS only when opted in (notify_sms) with recorded consent + a phone."""
+        return bool(self.notify_sms and self.phone and self.sms_consent_at)
+
+
+def _fetch_all(table: str, columns: str, page_size: int = 1000) -> list[dict]:
+    """Paginated select — Supabase/PostgREST defaults to 1000 rows."""
+    rows: list[dict] = []
+    start = 0
+    while True:
+        end = start + page_size - 1
+        result = _table(table).select(columns).range(start, end).execute()
+        batch = result.data or []
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        start += page_size
+    return rows
 
 
 def load_monitoring() -> dict[str, list[Subscriber]]:
     """Return a mapping of group_url -> subscribers (each with their keywords).
 
-    Small data volumes, so we fetch the three tables and join in memory.
+    Only scrapes catalog groups with scrape_enabled=true (and active/approved).
+    Small data volumes, so we fetch tables and join in memory.
     """
-    subs_rows = _table("subscribers").select("id, phone, notify_sms").execute().data
-    kw_rows = _table("keywords").select("subscriber_id, keyword").execute().data
-    grp_rows = _table("monitored_groups").select("subscriber_id, group_url").execute().data
+    subs_rows = _fetch_all("subscribers", "id, phone, notify_sms, sms_consent_at")
+    kw_rows = _fetch_all("keywords", "subscriber_id, keyword")
+    grp_rows = _fetch_all(
+        "monitored_groups",
+        "subscriber_id, group_url, facebook_group_uuid, status",
+    )
+    catalog_rows = (
+        _table("facebook_groups")
+        .select("id, group_url, canonical_url, scrape_enabled, active, review_status")
+        .eq("scrape_enabled", True)
+        .eq("active", True)
+        .eq("review_status", "approved")
+        .execute()
+        .data
+    )
+
+    scrape_by_id = {row["id"]: row for row in catalog_rows or []}
+    scrape_urls = {
+        (row.get("canonical_url") or row["group_url"])
+        for row in catalog_rows or []
+        if row.get("canonical_url") or row.get("group_url")
+    }
 
     keywords_by_sub: dict[str, list[str]] = {}
     for row in kw_rows:
@@ -57,17 +98,31 @@ def load_monitoring() -> dict[str, list[Subscriber]]:
             id=row["id"],
             phone=row.get("phone"),
             notify_sms=bool(row.get("notify_sms")),
+            sms_consent_at=row.get("sms_consent_at"),
             keywords=keywords_by_sub.get(row["id"], []),
         )
         for row in subs_rows
     }
 
     by_group: dict[str, list[Subscriber]] = {}
-    for row in grp_rows:
+    for row in grp_rows or []:
+        if row.get("status") and row["status"] != "active":
+            continue
+        catalog_id = row.get("facebook_group_uuid")
+        group_url = row.get("group_url")
+        allowed = False
+        if catalog_id and catalog_id in scrape_by_id:
+            allowed = True
+            catalog = scrape_by_id[catalog_id]
+            group_url = catalog.get("canonical_url") or catalog.get("group_url") or group_url
+        elif group_url and group_url in scrape_urls:
+            allowed = True
+        if not allowed or not group_url:
+            continue
         sub = subscribers.get(row["subscriber_id"])
         # Skip subscribers with no keywords; nothing could ever match.
         if sub and sub.keywords:
-            by_group.setdefault(row["group_url"], []).append(sub)
+            by_group.setdefault(group_url, []).append(sub)
     return by_group
 
 

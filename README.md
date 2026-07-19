@@ -15,7 +15,7 @@ loop (every MIN_INTERVAL_SECONDS, non-overlapping):
   2. scrape all distinct group URLs in ONE Apify run   (scraper.py)
   3. for each post, case-insensitively match keywords  (matcher.py)
   4. INSERT notification_logs (unique subscriber_id, post_url)  -> idempotency
-  5. if newly inserted AND notify_sms: send SMS + log sms_sendouts (notifier.py)
+  5. if newly inserted AND sms_enabled (notify_sms + consent + phone): send SMS + log sms_sendouts (notifier.py)
   6. log cycle metrics to engine_runs (posts_scraped, matches_found, apify_run_id)
 ```
 
@@ -56,7 +56,7 @@ DEV_SUPABASE_SERVICE_ROLE_KEY=
 
 APIFY_TOKEN=
 APIFY_ACTOR_ID=apify/facebook-groups-scraper
-MIN_INTERVAL_SECONDS=120
+MIN_INTERVAL_SECONDS=600
 RESULTS_LIMIT=20
 # Time window for scraping, e.g. "10 minutes", "6 hours", "1 day". Empty = off.
 LOOKBACK=30 minutes
@@ -65,9 +65,9 @@ LOOKBACK=30 minutes
 Required for the active `ENV`: that project's URL + service-role key, plus
 `APIFY_TOKEN`.
 
-**SMS is simulated for now.** The notifier writes one `.txt` file per message into
-`outbox/` and inserts a row into `sms_sendouts` (full message body for the admin
-Sendouts page). Apply `../UGetFirst_web/supabase/migrations/012_sms_sendouts.sql`
+**SMS** uses Twilio when `SMS_MODE=twilio` (or when `TWILIO_*` are set and
+`SMS_MODE` is unset). Otherwise messages are written to `outbox/` (`simulated`).
+Apply `../UGetFirst_web/supabase/migrations/012_sms_sendouts.sql`
 on **both** Supabase projects before running the engine.
 
 Each cycle also writes one row to `engine_runs` (`posts_scraped`, `matches_found`,
@@ -116,13 +116,12 @@ python scripts/cleanup_keywords.py --apply
 
 ## Notes / TODO before production
 
-- **Confirm Apify output fields.** `scraper.py` normalizes post URL/text/group
-  from a list of candidate field names; run `--once --dump-raw-keys` against a
-  real public group to verify and trim the candidates.
-- **Wire a real SMS provider** (Text Request / Twilio) into `notifier.py` once
-  10DLC registration clears. Until then messages are written to `outbox/`. We
-  already respect `notify_sms = false`.
+- **Wire Twilio:** set `SMS_MODE=twilio` + `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN` /
+  `TWILIO_FROM_NUMBER` after 10DLC clears. Until then keep simulated outbox.
+- **Inbound STOP/HELP:** configure Twilio Messaging webhook to the web app
+  `POST /api/twilio/inbound` (see `UGetFirst_web/docs/A2P_RESUBMIT.md`).
+- Confirm Apify output with `--once --dump-raw-keys` after actor upgrades.
 - Many waitlist users have **no group URL** yet — those subscribers simply won't
   match anything until a group is added.
-- For real 24/7 reliability, move off the local machine to a small VPS running
-  `python main.py` under systemd/Docker with auto-restart.
+- Scale knobs: `RESULTS_PER_GROUP`, `SCRAPE_BATCH_SIZE`, `APIFY_MAX_RETRIES`.
+- For real 24/7 reliability, run under systemd on the VPS (see `deploy/`).

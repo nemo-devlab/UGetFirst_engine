@@ -66,8 +66,8 @@ def run_cycle(dump_raw_keys: bool = False) -> None:
                     continue
                 matches_found += 1
                 body = notifier.build_message(keyword, post.url)
-                if sub.notify_sms and sub.phone:
-                    notifier.send(sub.phone, keyword, post.url)
+                if sub.sms_enabled:
+                    result = notifier.send(sub.phone, keyword, post.url)
                     db.log_sendout(
                         subscriber_id=sub.id,
                         notification_log_id=notification_log_id,
@@ -75,11 +75,21 @@ def run_cycle(dump_raw_keys: bool = False) -> None:
                         body=body,
                         keyword=keyword,
                         post_url=post.url,
-                        channel="simulated",
-                        status="sent",
+                        channel=result.channel,
+                        status=result.status,
+                        provider_message_id=result.provider_message_id,
+                        error=result.error,
                     )
-                    sent += 1
+                    if result.status == "sent":
+                        sent += 1
                 else:
+                    skip_reason = (
+                        "no phone"
+                        if not sub.phone
+                        else "no sms consent"
+                        if not sub.sms_consent_at
+                        else "notify_sms off"
+                    )
                     db.log_sendout(
                         subscriber_id=sub.id,
                         notification_log_id=notification_log_id,
@@ -89,9 +99,13 @@ def run_cycle(dump_raw_keys: bool = False) -> None:
                         post_url=post.url,
                         channel="simulated",
                         status="skipped",
-                        error="notify_sms off or no phone",
+                        error=skip_reason,
                     )
-                    log.info("Logged match for %s but SMS suppressed (opt-out/no phone)", sub.id)
+                    log.info(
+                        "Logged match for %s but SMS suppressed (%s)",
+                        sub.id,
+                        skip_reason,
+                    )
         log.info(
             "Cycle complete: %d post(s) scraped, %d new match(es), %d SMS dispatched.",
             posts_scraped,
@@ -129,10 +143,11 @@ def main() -> None:
     args = parser.parse_args()
 
     log.info(
-        "Starting engine (ENV=%s, project=%s, schema=%s, sms=SIMULATED->outbox/)",
+        "Starting engine (ENV=%s, project=%s, schema=%s, sms=%s)",
         config.ENV,
         config.SUPABASE_URL,
         config.DB_SCHEMA,
+        config.SMS_MODE,
     )
 
     if args.once:
