@@ -23,6 +23,25 @@ bash scripts/vps-setup-health.sh
 
 That script installs both systemd units, opens UFW port 8080, and restarts services.
 
+## Daily PROD → DEV sync
+
+On the droplet, a **user crontab** runs `scripts/sync_prod_to_dev.py --apply` every day at **00:00 UTC**. Requires both `PROD_SUPABASE_*` and `DEV_SUPABASE_*` in the droplet `.env`.
+
+```bash
+# install / refresh the cron line
+bash scripts/vps-setup-sync-cron.sh
+
+# inspect
+crontab -l
+tail -f ~/UGetFirst_engine/logs/sync_prod_to_dev.log
+
+# manual dry-run / apply
+cd ~/UGetFirst_engine && .venv/bin/python scripts/sync_prod_to_dev.py --dry-run
+cd ~/UGetFirst_engine && .venv/bin/python scripts/sync_prod_to_dev.py --apply
+```
+
+Optional systemd units also live in `deploy/ugetfirst-sync-prod-to-dev.{service,timer}` if you prefer `systemctl` (needs sudo to install).
+
 **Also check DigitalOcean cloud firewall:** Networking → Firewalls → allow **Inbound TCP 8080** to the droplet (UFW alone is not enough if a DO firewall is attached).
 
 ## DO uptime check
@@ -42,7 +61,16 @@ ENGINE_ADMIN_TOKEN=long-random-string   # admin dashboard restart + JSON health
 ```
 
 Admin dashboard (`UGetFirst_admin`) uses `ENGINE_HEALTH_URL` and `ENGINE_ADMIN_TOKEN`
-to read status and `POST /admin/restart`. Install passwordless sudo once:
+to read status and `POST /admin/start|stop|restart`. After pulling engine updates that
+change `health.py`, restart the health service:
+
+```bash
+cd ~/UGetFirst_engine && git pull
+sudo systemctl restart ugetfirst-health
+curl -s -X POST http://127.0.0.1:8080/admin/start   # expect {"ok":true,...}
+```
+
+Install passwordless sudo once:
 
 ```bash
 sudo cp deploy/sudoers-ugetfirst-engine /etc/sudoers.d/ugetfirst-engine

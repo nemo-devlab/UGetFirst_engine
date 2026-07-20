@@ -1,11 +1,12 @@
 """Apify wrapper for the facebook-groups-scraper actor.
 
-Runs one actor call for all distinct group URLs, then normalizes each dataset
-item into a small, stable Post shape the rest of the app relies on.
+Runs actor call(s) for all distinct group URLs (batched), then normalizes each
+dataset item into a small, stable Post shape the rest of the app relies on.
 """
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 from apify_client import ApifyClient
@@ -29,9 +30,9 @@ class ScrapeResult:
     apify_run_id: str | None
 
 
-# Actor output field names can vary; check these in order. Confirmed against a
-# live test run during first build (logged via --dump-raw if needed).
-_URL_FIELDS = ("url", "postUrl", "topLevelUrl", "facebookUrl", "link")
+# Locked field order from live Apify facebook-groups-scraper runs.
+# Prefer facebookUrl / text / groupUrl; keep fallbacks for actor version drift.
+_URL_FIELDS = ("facebookUrl", "url", "postUrl", "topLevelUrl", "link")
 _TEXT_FIELDS = ("text", "message", "postText", "content")
 _GROUP_FIELDS = ("groupUrl", "groupId", "facebookGroupUrl", "groupTitle")
 
@@ -69,42 +70,82 @@ def _run_id(run) -> str | None:
     return getattr(run, "id", None)
 
 
-def scrape(group_urls: list[str], dump_raw_keys: bool = False) -> ScrapeResult:
-    """Scrape recent posts for the given group URLs via one actor run.
+def _results_limit_for(group_count: int) -> int:
+    """Scale Apify resultsLimit with group count so posts aren't starved."""
+    scaled = max(config.RESULTS_LIMIT, group_count * config.RESULTS_PER_GROUP)
+    return min(scaled, 500)
 
-    Fetches posts within the LOOKBACK time window (newest-first, capped at
-    RESULTS_LIMIT) and relies on the unique (subscriber_id, post_url) constraint
-    on notification_logs to avoid re-notifying for posts we've already seen.
+
+def _call_actor(apify: ApifyClient, group_urls: list[str], dump_raw_keys: bool):
+    run_input = {
+        "startUrls": [{"url": u} for u in group_urls],
+        "resultsLimit": _results_limit_for(len(group_urls)),
+        "viewOption": "CHRONOLOGICAL",
+    }
+    if config.LOOKBACK:
+        run_input["onlyPostsNewerThan"] = config.LOOKBACK
+
+    last_exc: Exception | None = None
+    attempts = 1 + max(0, config.APIFY_MAX_RETRIES)
+    for attempt in range(1, attempts + 1):
+        try:
+            log.info(
+                "Starting Apify actor for %d group(s) (limit=%d, lookback=%s, attempt=%d/%d)",
+                len(group_urls),
+                run_input["resultsLimit"],
+                config.LOOKBACK or "none",
+                attempt,
+                attempts,
+            )
+            run = apify.actor(config.APIFY_ACTOR_ID).call(run_input=run_input)
+            posts: list[Post] = []
+            dataset_id = _dataset_id(run)
+            for item in apify.dataset(dataset_id).iterate_items():
+                if dump_raw_keys:
+                    log.info("Raw item keys: %s", sorted(item.keys()))
+                post = _normalize(item)
+                if post:
+                    posts.append(post)
+            return posts, _run_id(run)
+        except Exception as exc:
+            last_exc = exc
+            log.warning("Apify call failed (attempt %d/%d): %s", attempt, attempts, exc)
+            if attempt < attempts:
+                time.sleep(min(30, 2 ** attempt))
+    assert last_exc is not None
+    raise last_exc
+
+
+def scrape(group_urls: list[str], dump_raw_keys: bool = False) -> ScrapeResult:
+    """Scrape recent posts for the given group URLs via batched actor runs.
+
+    Fetches posts within the LOOKBACK time window (newest-first, capped per
+    batch) and relies on the unique (subscriber_id, post_url) constraint on
+    notification_logs to avoid re-notifying for posts we've already seen.
     """
     if not group_urls:
         return ScrapeResult(posts=[], apify_run_id=None)
     if not config.APIFY_TOKEN:
         raise RuntimeError("APIFY_TOKEN is not set; cannot scrape.")
 
-    run_input = {
-        "startUrls": [{"url": u} for u in group_urls],
-        "resultsLimit": config.RESULTS_LIMIT,
-        "viewOption": "CHRONOLOGICAL",
-    }
-    # Only include the time filter when set; the actor rejects a null value.
-    if config.LOOKBACK:
-        run_input["onlyPostsNewerThan"] = config.LOOKBACK
-
     apify = ApifyClient(config.APIFY_TOKEN)
-    log.info(
-        "Starting Apify actor for %d group(s) (onlyPostsNewerThan=%s)",
-        len(group_urls),
-        config.LOOKBACK or "none",
-    )
-    run = apify.actor(config.APIFY_ACTOR_ID).call(run_input=run_input)
+    batch_size = max(1, config.SCRAPE_BATCH_SIZE)
+    all_posts: list[Post] = []
+    run_ids: list[str] = []
 
-    posts: list[Post] = []
-    dataset_id = _dataset_id(run)
-    for item in apify.dataset(dataset_id).iterate_items():
-        if dump_raw_keys:
-            log.info("Raw item keys: %s", sorted(item.keys()))
-        post = _normalize(item)
-        if post:
-            posts.append(post)
-    log.info("Scraped %d normalized post(s)", len(posts))
-    return ScrapeResult(posts=posts, apify_run_id=_run_id(run))
+    for i in range(0, len(group_urls), batch_size):
+        batch = group_urls[i : i + batch_size]
+        posts, run_id = _call_actor(apify, batch, dump_raw_keys=dump_raw_keys)
+        all_posts.extend(posts)
+        if run_id:
+            run_ids.append(run_id)
+
+    log.info(
+        "Scraped %d normalized post(s) across %d batch(es)",
+        len(all_posts),
+        max(1, (len(group_urls) + batch_size - 1) // batch_size),
+    )
+    return ScrapeResult(
+        posts=all_posts,
+        apify_run_id=run_ids[0] if len(run_ids) == 1 else (",".join(run_ids) or None),
+    )

@@ -4,8 +4,9 @@ The engine writes a heartbeat file after each successful cycle. A separate
 `ugetfirst-health.service` (or the embedded server) reads it and exposes
 GET /health on HEALTH_PORT (default 8080).
 
-POST /admin/restart restarts ugetfirst-engine (token required). Install
-deploy/sudoers-ugetfirst-engine on the VPS for passwordless restart.
+POST /admin/start|stop|restart control ugetfirst-engine (token required).
+POST /admin/env {"env":"prod"|"dev"} updates .env ENV and restarts if running.
+Install deploy/sudoers-ugetfirst-engine on the VPS for passwordless systemctl.
 """
 from __future__ import annotations
 
@@ -23,6 +24,8 @@ import config
 log = logging.getLogger("ugetfirst.health")
 
 HEARTBEAT_PATH = Path(__file__).resolve().parent / ".engine-heartbeat"
+ENV_FILE_PATH = Path(__file__).resolve().parent / ".env"
+ENGINE_UNIT = "ugetfirst-engine"
 
 
 def _write_heartbeat(at: datetime) -> None:
@@ -67,6 +70,82 @@ def is_healthy() -> bool:
     return since <= stale_after
 
 
+def _read_env_file_value(key: str) -> str | None:
+    """Read KEY=value from the engine .env without importing config (hot-readable)."""
+    try:
+        lines = ENV_FILE_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    prefix = f"{key}="
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith(prefix):
+            return stripped[len(prefix) :].strip().strip('"').strip("'")
+    return None
+
+
+def read_configured_env() -> str:
+    """Current engine DB target from .env (falls back to imported config.ENV)."""
+    raw = (_read_env_file_value("ENV") or config.ENV or "dev").strip().lower()
+    return raw if raw in ("dev", "prod") else "dev"
+
+
+def set_configured_env(target: str) -> tuple[bool, str]:
+    """Update ENV= in .env. Returns (ok, message). Does not restart services."""
+    target = target.strip().lower()
+    if target not in ("dev", "prod"):
+        return False, "env must be 'dev' or 'prod'"
+    if not ENV_FILE_PATH.is_file():
+        return False, f".env not found at {ENV_FILE_PATH}"
+
+    try:
+        original = ENV_FILE_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, str(exc)
+
+    lines = original.splitlines(keepends=True)
+    found = False
+    out: list[str] = []
+    for line in lines:
+        stripped = line.lstrip()
+        if stripped.startswith("ENV="):
+            # Preserve indentation / newline style
+            nl = "\n" if line.endswith("\n") else ""
+            if line.endswith("\r\n"):
+                nl = "\r\n"
+            out.append(f"ENV={target}{nl}")
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        if out and not out[-1].endswith("\n"):
+            out.append("\n")
+        out.append(f"ENV={target}\n")
+
+    try:
+        ENV_FILE_PATH.write_text("".join(out), encoding="utf-8")
+    except OSError as exc:
+        return False, str(exc)
+
+    return True, f"ENV set to {target}"
+
+
+def switch_engine_env(target: str) -> tuple[bool, str]:
+    """Write ENV to .env and restart the engine if it was running."""
+    was_active = _engine_active()
+    ok, message = set_configured_env(target)
+    if not ok:
+        return False, message
+    if was_active:
+        restarted, detail = restart_engine_service()
+        if not restarted:
+            return False, f"{message}, but restart failed: {detail}"
+        return True, f"{message}; engine restarted on {target}"
+    return True, f"{message} (engine stopped — will use {target} on next start)"
+
+
 def _admin_token() -> str:
     return (
         os.getenv("ENGINE_ADMIN_TOKEN", "").strip()
@@ -92,39 +171,77 @@ def _authorized(path: str, headers: dict[str, str]) -> bool:
     return False
 
 
+def _engine_active() -> bool:
+    """True when ugetfirst-engine systemd unit is active (no sudo needed)."""
+    try:
+        proc = subprocess.run(
+            ["systemctl", "is-active", "--quiet", ENGINE_UNIT],
+            timeout=5,
+            check=False,
+        )
+        return proc.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def health_payload() -> dict[str, object]:
     """Serializable health snapshot for /health and admin dashboards."""
-    healthy = is_healthy()
+    engine_active = _engine_active()
+    cycle_ok = is_healthy()
     since = _seconds_since_success()
     last = _last_success_at()
+    if not engine_active:
+        status = "stopped"
+    elif cycle_ok:
+        status = "ok"
+    else:
+        status = "stale"
     return {
-        "status": "ok" if healthy else "stale",
-        "healthy": healthy,
-        "env": config.ENV,
+        "status": status,
+        # Healthy for uptime monitors = service running and recent successful cycle
+        "healthy": engine_active and cycle_ok,
+        "engine_active": engine_active,
+        "cycle_ok": cycle_ok,
+        "env": read_configured_env(),
+        "min_interval_seconds": config.MIN_INTERVAL_SECONDS,
         "last_success_at": last.isoformat() if last else None,
         "last_success_seconds_ago": round(since, 1) if since is not None else None,
         "stale_after_seconds": config.MIN_INTERVAL_SECONDS * 2.5,
     }
 
 
-def restart_engine_service() -> tuple[bool, str]:
-    """Restart the scraper systemd unit (requires passwordless sudo on VPS)."""
+def _systemctl_engine(action: str) -> tuple[bool, str]:
+    """Run systemctl <action> on ugetfirst-engine (requires passwordless sudo)."""
+    if action not in ("start", "stop", "restart"):
+        return False, f"unsupported action: {action}"
     try:
         proc = subprocess.run(
-            ["sudo", "systemctl", "restart", "ugetfirst-engine"],
+            ["sudo", "systemctl", action, ENGINE_UNIT],
             capture_output=True,
             text=True,
             timeout=30,
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return False, "restart timed out after 30s"
+        return False, f"{action} timed out after 30s"
     except OSError as exc:
         return False, str(exc)
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "systemctl failed").strip()
         return False, detail[:500]
-    return True, "ugetfirst-engine restarted"
+    return True, f"{ENGINE_UNIT} {action}ed"
+
+
+def restart_engine_service() -> tuple[bool, str]:
+    return _systemctl_engine("restart")
+
+
+def start_engine_service() -> tuple[bool, str]:
+    return _systemctl_engine("start")
+
+
+def stop_engine_service() -> tuple[bool, str]:
+    return _systemctl_engine("stop")
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -184,16 +301,50 @@ class _HealthHandler(BaseHTTPRequestHandler):
             return
 
         route = urlparse(self.path).path.rstrip("/") or "/"
-        if route != "/admin/restart":
+
+        if route == "/admin/env":
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                self._send_json(400, {"ok": False, "error": "invalid JSON"})
+                return
+            target = str(body.get("env", "")).strip().lower()
+            ok, message = switch_engine_env(target)
+            if ok:
+                log.info("Admin env switch: %s", message)
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "message": message,
+                        "env": read_configured_env(),
+                        "engine_active": _engine_active(),
+                    },
+                )
+                return
+            log.warning("Admin env switch failed: %s", message)
+            self._send_json(500, {"ok": False, "error": message})
+            return
+
+        actions = {
+            "/admin/restart": ("restart", restart_engine_service),
+            "/admin/start": ("start", start_engine_service),
+            "/admin/stop": ("stop", stop_engine_service),
+        }
+        entry = actions.get(route)
+        if entry is None:
             self._send_json(404, {"ok": False, "error": "not found"})
             return
 
-        ok, message = restart_engine_service()
+        label, fn = entry
+        ok, message = fn()
         if ok:
-            log.info("Admin restart: %s", message)
+            log.info("Admin %s: %s", label, message)
             self._send_json(200, {"ok": True, "message": message})
             return
-        log.warning("Admin restart failed: %s", message)
+        log.warning("Admin %s failed: %s", label, message)
         self._send_json(500, {"ok": False, "error": message})
 
     def log_message(self, format: str, *args) -> None:  # noqa: A003

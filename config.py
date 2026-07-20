@@ -84,6 +84,13 @@ TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "").strip()
 # Shared secret for inbound STOP/HELP webhook (optional but recommended).
 TWILIO_WEBHOOK_AUTH_TOKEN = os.getenv("TWILIO_WEBHOOK_AUTH_TOKEN", "").strip() or TWILIO_AUTH_TOKEN
 
+# Cap SMS sends per subscriber within a single engine cycle (0 = unlimited).
+SMS_MAX_PER_SUBSCRIBER_PER_CYCLE = int(
+    os.getenv("SMS_MAX_PER_SUBSCRIBER_PER_CYCLE", "5")
+)
+# Pause between Twilio/outbox sends in a cycle (Twilio 429 cushion). 0 = no delay.
+SMS_SEND_DELAY_MS = int(os.getenv("SMS_SEND_DELAY_MS", "250"))
+
 MIN_INTERVAL_SECONDS = int(os.getenv("MIN_INTERVAL_SECONDS", "600"))
 # Per-group post cap. Total resultsLimit for an Apify run = max(RESULTS_LIMIT, groups * RESULTS_PER_GROUP).
 RESULTS_LIMIT = int(os.getenv("RESULTS_LIMIT", "20"))

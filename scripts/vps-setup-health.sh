@@ -20,6 +20,9 @@ sudo systemctl enable ugetfirst-health ugetfirst-engine
 sudo systemctl restart ugetfirst-health
 sudo systemctl restart ugetfirst-engine
 
+echo "==> install daily PROD→DEV sync cron (no sudo)"
+bash scripts/vps-setup-sync-cron.sh
+
 echo "==> open port 8080 (ufw)"
 if command -v ufw >/dev/null 2>&1; then
   sudo ufw allow OpenSSH || true

@@ -34,7 +34,7 @@ def run_cycle(dump_raw_keys: bool = False) -> None:
     try:
         by_group = db.load_monitoring()
         if not by_group:
-            log.info("No monitored groups with keywords; nothing to do.")
+            log.info("No groups with SMS-enabled subscribers; nothing to do.")
             run_id = db.start_engine_run(0)
             db.finish_engine_run(run_id)
             return
@@ -54,6 +54,11 @@ def run_cycle(dump_raw_keys: bool = False) -> None:
         apify_run_id = scrape_result.apify_run_id
         posts_scraped = len(posts)
 
+        # Per-subscriber SMS sent this cycle (rate limit).
+        sms_sent_by_sub: dict[str, int] = {}
+        max_per_sub = config.SMS_MAX_PER_SUBSCRIBER_PER_CYCLE
+        delay_s = max(0, config.SMS_SEND_DELAY_MS) / 1000.0
+
         for post in posts:
             subs = subs_by_gid.get(post.group_id or "", [])
             for sub in subs:
@@ -66,23 +71,8 @@ def run_cycle(dump_raw_keys: bool = False) -> None:
                     continue
                 matches_found += 1
                 body = notifier.build_message(keyword, post.url)
-                if sub.sms_enabled:
-                    result = notifier.send(sub.phone, keyword, post.url)
-                    db.log_sendout(
-                        subscriber_id=sub.id,
-                        notification_log_id=notification_log_id,
-                        phone=sub.phone,
-                        body=body,
-                        keyword=keyword,
-                        post_url=post.url,
-                        channel=result.channel,
-                        status=result.status,
-                        provider_message_id=result.provider_message_id,
-                        error=result.error,
-                    )
-                    if result.status == "sent":
-                        sent += 1
-                else:
+
+                if not sub.sms_enabled:
                     skip_reason = (
                         "no phone"
                         if not sub.phone
@@ -106,6 +96,47 @@ def run_cycle(dump_raw_keys: bool = False) -> None:
                         sub.id,
                         skip_reason,
                     )
+                    continue
+
+                already = sms_sent_by_sub.get(sub.id, 0)
+                if max_per_sub > 0 and already >= max_per_sub:
+                    db.log_sendout(
+                        subscriber_id=sub.id,
+                        notification_log_id=notification_log_id,
+                        phone=sub.phone or "",
+                        body=body,
+                        keyword=keyword,
+                        post_url=post.url,
+                        channel="simulated",
+                        status="skipped",
+                        error="rate_limited_cycle",
+                    )
+                    log.info(
+                        "Rate-limited SMS for %s (cap=%d/cycle)",
+                        sub.id,
+                        max_per_sub,
+                    )
+                    continue
+
+                if delay_s > 0 and sent > 0:
+                    time.sleep(delay_s)
+
+                result = notifier.send(sub.phone, keyword, post.url)
+                db.log_sendout(
+                    subscriber_id=sub.id,
+                    notification_log_id=notification_log_id,
+                    phone=sub.phone,
+                    body=body,
+                    keyword=keyword,
+                    post_url=post.url,
+                    channel=result.channel,
+                    status=result.status,
+                    provider_message_id=result.provider_message_id,
+                    error=result.error,
+                )
+                if result.status == "sent":
+                    sent += 1
+                    sms_sent_by_sub[sub.id] = already + 1
         log.info(
             "Cycle complete: %d post(s) scraped, %d new match(es), %d SMS dispatched.",
             posts_scraped,

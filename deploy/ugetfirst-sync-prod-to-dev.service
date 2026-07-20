@@ -1,0 +1,17 @@
+[Unit]
+Description=UGetFirst overwrite DEV Supabase from PROD
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ugetfirst
+Group=ugetfirst
+WorkingDirectory=/home/ugetfirst/UGetFirst_engine
+EnvironmentFile=/home/ugetfirst/UGetFirst_engine/.env
+ExecStart=/home/ugetfirst/UGetFirst_engine/.venv/bin/python scripts/sync_prod_to_dev.py --apply
+Nice=10
+
+# Log to journald: journalctl -u ugetfirst-sync-prod-to-dev
+StandardOutput=journal
+StandardError=journal

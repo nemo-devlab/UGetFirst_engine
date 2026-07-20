@@ -1,5 +1,7 @@
-# Passwordless restart for the admin dashboard (install on the VPS once).
+# Passwordless engine control for the admin dashboard (install on the VPS once).
 #   sudo cp deploy/sudoers-ugetfirst-engine /etc/sudoers.d/ugetfirst-engine
 #   sudo chmod 440 /etc/sudoers.d/ugetfirst-engine
 #   sudo visudo -cf /etc/sudoers.d/ugetfirst-engine
+ugetfirst ALL=(ALL) NOPASSWD: /bin/systemctl start ugetfirst-engine
+ugetfirst ALL=(ALL) NOPASSWD: /bin/systemctl stop ugetfirst-engine
 ugetfirst ALL=(ALL) NOPASSWD: /bin/systemctl restart ugetfirst-engine

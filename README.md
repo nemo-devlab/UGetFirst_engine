@@ -11,17 +11,24 @@ separate Supabase projects** (schema is always `public` in both).
 
 ```
 loop (every MIN_INTERVAL_SECONDS, non-overlapping):
-  1. load monitored groups + subscribers + keywords   (db.py)
-  2. scrape all distinct group URLs in ONE Apify run   (scraper.py)
-  3. for each post, case-insensitively match keywords  (matcher.py)
+  1. load groups with ≥1 SMS-enabled subscriber (+ keywords)  (db.py)
+  2. scrape those group URLs (batched Apify runs)             (scraper.py)
+  3. for each post, case-insensitively match keywords         (matcher.py)
   4. INSERT notification_logs (unique subscriber_id, post_url)  -> idempotency
-  5. if newly inserted AND sms_enabled (notify_sms + consent + phone): send SMS + log sms_sendouts (notifier.py)
+  5. if newly inserted: send SMS (rate-limited) + log sms_sendouts (notifier.py)
   6. log cycle metrics to engine_runs (posts_scraped, matches_found, apify_run_id)
 ```
 
+- **Scrape set:** only catalog groups (`scrape_enabled` + active/approved) that
+  have at least one watcher with keywords **and** `sms_enabled` (`notify_sms` +
+  consent + phone). Muted / incomplete SMS subscribers do not keep a group in
+  the Apify set.
 - **Dedup / idempotency:** the unique `(subscriber_id, post_url)` constraint on
   `notification_logs` guarantees a subscriber is never texted twice for the same
   post. We only send when the insert is new.
+- **SMS rate limit:** at most `SMS_MAX_PER_SUBSCRIBER_PER_CYCLE` sends per
+  subscriber per cycle (extras logged as `skipped` / `rate_limited_cycle`);
+  optional `SMS_SEND_DELAY_MS` between sends.
 - **New posts:** each cycle we fetch posts within the `LOOKBACK` time window
   (`onlyPostsNewerThan`, newest-first, capped at `RESULTS_LIMIT`). Dedup above
   ensures we only text on posts we haven't seen before. Stateless — no
@@ -102,6 +109,8 @@ python scripts/sync_prod_to_dev.py --apply
 python scripts/seed_test_groups.py --apply
 ```
 
+On the production droplet, the same sync runs automatically every day at **00:00 UTC** via user crontab (`scripts/vps-setup-sync-cron.sh`; see `deploy/DIGITALOCEAN_UPTIME.md`).
+
 Edit `FACEBOOK_GROUPS` in `scripts/seed_test_groups.py` to change the curated list.
 
 ### One-time keyword cleanup (prod → cleaned copy on dev)
@@ -123,5 +132,6 @@ python scripts/cleanup_keywords.py --apply
 - Confirm Apify output with `--once --dump-raw-keys` after actor upgrades.
 - Many waitlist users have **no group URL** yet — those subscribers simply won't
   match anything until a group is added.
-- Scale knobs: `RESULTS_PER_GROUP`, `SCRAPE_BATCH_SIZE`, `APIFY_MAX_RETRIES`.
+- Scale knobs: `RESULTS_PER_GROUP`, `SCRAPE_BATCH_SIZE`, `APIFY_MAX_RETRIES`,
+  `SMS_MAX_PER_SUBSCRIBER_PER_CYCLE`, `SMS_SEND_DELAY_MS`.
 - For real 24/7 reliability, run under systemd on the VPS (see `deploy/`).

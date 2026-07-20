@@ -58,9 +58,11 @@ def _fetch_all(table: str, columns: str, page_size: int = 1000) -> list[dict]:
 
 
 def load_monitoring() -> dict[str, list[Subscriber]]:
-    """Return a mapping of group_url -> subscribers (each with their keywords).
+    """Return a mapping of group_url -> SMS-enabled subscribers (with keywords).
 
-    Only scrapes catalog groups with scrape_enabled=true (and active/approved).
+    Only includes catalog groups with scrape_enabled=true (and active/approved),
+    and only subscribers who can actually receive SMS (sms_enabled + keywords).
+    Groups with no such watchers are omitted from the scrape set.
     Small data volumes, so we fetch tables and join in memory.
     """
     subs_rows = _fetch_all("subscribers", "id, phone, notify_sms, sms_consent_at")
@@ -120,8 +122,8 @@ def load_monitoring() -> dict[str, list[Subscriber]]:
         if not allowed or not group_url:
             continue
         sub = subscribers.get(row["subscriber_id"])
-        # Skip subscribers with no keywords; nothing could ever match.
-        if sub and sub.keywords:
+        # Skip muted / incomplete SMS setup and keyword-less subs — no scrape value.
+        if sub and sub.keywords and sub.sms_enabled:
             by_group.setdefault(group_url, []).append(sub)
     return by_group
 

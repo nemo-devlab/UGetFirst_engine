@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily PROD → DEV Supabase sync at midnight UTC
+
+[Timer]
+# Midnight UTC every day
+OnCalendar=*-*-* 00:00:00 UTC
+Persistent=true
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
