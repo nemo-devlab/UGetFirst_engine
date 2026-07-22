@@ -1,8 +1,8 @@
 # UGetFirst Engine
 
 Scraping + notification worker for **UGetFirst** — *"First to Know. First to Win."*
-Polls public Facebook groups for user keywords and sends an SMS the moment a
-matching post appears.
+Polls public Facebook groups for user keywords and sends email and/or SMS when
+a matching post appears.
 
 This repo shares Supabase with the website and admin repos. **Prod and Dev are
 separate Supabase projects** (schema is always `public` in both).
@@ -10,29 +10,24 @@ separate Supabase projects** (schema is always `public` in both).
 ## How it works
 
 ```
-loop (every MIN_INTERVAL_SECONDS, non-overlapping):
-  1. load groups with ≥1 SMS-enabled subscriber (+ keywords)  (db.py)
-  2. scrape those group URLs (batched Apify runs)             (scraper.py)
-  3. for each post, case-insensitively match keywords         (matcher.py)
-  4. INSERT notification_logs (unique subscriber_id, post_url)  -> idempotency
-  5. if newly inserted: send SMS (rate-limited) + log sms_sendouts (notifier.py)
-  6. log cycle metrics to engine_runs (posts_scraped, matches_found, apify_run_id)
+loop (every MIN_INTERVAL_SECONDS tick, non-overlapping):
+  1. load groups with ≥1 alert-ready subscriber (+ keywords)  (db.py)
+  2. filter to due groups (Free 30m / Speed 20m / Lightning 10m)
+  3. scrape due URLs (batched Apify; LOOKBACK from max due interval)
+  4. stamp facebook_groups.last_scraped_at
+  5. upsert posts into scraped_posts (data asset)             (db.py)
+  6. match keywords                                           (matcher.py)
+  7. INSERT notification_logs (unique subscriber_id, post_url)
+  8. SMS and/or email + sms_sendouts                          (notifier.py)
+  9. log cycle metrics to engine_runs
 ```
 
-- **Scrape set:** only catalog groups (`scrape_enabled` + active/approved) that
-  have at least one watcher with keywords **and** `sms_enabled` (`notify_sms` +
-  consent + phone). Muted / incomplete SMS subscribers do not keep a group in
-  the Apify set.
-- **Dedup / idempotency:** the unique `(subscriber_id, post_url)` constraint on
-  `notification_logs` guarantees a subscriber is never texted twice for the same
-  post. We only send when the insert is new.
-- **SMS rate limit:** at most `SMS_MAX_PER_SUBSCRIBER_PER_CYCLE` sends per
-  subscriber per cycle (extras logged as `skipped` / `rate_limited_cycle`);
-  optional `SMS_SEND_DELAY_MS` between sends.
-- **New posts:** each cycle we fetch posts within the `LOOKBACK` time window
-  (`onlyPostsNewerThan`, newest-first, capped at `RESULTS_LIMIT`). Dedup above
-  ensures we only text on posts we haven't seen before. Stateless — no
-  high-water-mark table needed.
+- **Alert-ready:** keywords + (`notify_email`+email) and/or (Speed/Lightning
+  billable + SMS consent). Free email-only watchers keep groups in Apify at ~30m.
+- **Cadence:** fastest watcher on a group wins; undued groups are skipped each tick.
+- **Data asset:** every scraped post upserted into `scraped_posts` (unique `post_url`).
+- **Dedup:** unique `(subscriber_id, post_url)` on `notification_logs`.
+- **Rate limit:** `SMS_MAX_PER_SUBSCRIBER_PER_CYCLE` across SMS+email sends.
 
 ## Environments (dev vs prod)
 
@@ -101,7 +96,8 @@ python main.py
 ### DEV test setup (prod mirror + curated groups)
 
 ```bash
-# Wipe DEV and copy prod subscribers/keywords/etc. (excludes notification_logs)
+# Mirror PROD account/catalog → DEV (skips notification_logs, sms_sendouts,
+# engine_runs, scraped_posts)
 python scripts/sync_prod_to_dev.py --dry-run
 python scripts/sync_prod_to_dev.py --apply
 

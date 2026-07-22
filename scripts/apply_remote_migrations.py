@@ -24,6 +24,11 @@ MIGRATIONS = [
     ("both", WEB_MIGRATIONS / "013_engine_runs.sql"),
     ("both", WEB_MIGRATIONS / "014_facebook_groups_curation.sql"),
     ("prod", WEB_MIGRATIONS / "013_drop_dev_schema.sql"),
+    ("both", WEB_MIGRATIONS / "021_scraped_posts.sql"),
+    ("both", WEB_MIGRATIONS / "022_feedback.sql"),
+    ("both", WEB_MIGRATIONS / "023_feedback_status.sql"),
+    ("both", WEB_MIGRATIONS / "024_feedback_message_limit.sql"),
+    ("both", WEB_MIGRATIONS / "025_billing_cadence.sql"),
 ]
 
 

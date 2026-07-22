@@ -1,8 +1,9 @@
-"""UGetFirst engine: poll Facebook groups, match keywords, send SMS.
+"""UGetFirst engine: poll Facebook groups, match keywords, send SMS/email.
 
 Runs one cycle synchronously, then sleeps so cycles never overlap and never
-start more often than MIN_INTERVAL_SECONDS. Idempotency is guaranteed by the
-unique (subscriber_id, post_url) constraint on notification_logs.
+start more often than MIN_INTERVAL_SECONDS. Per-group cadence skips groups
+that are not due yet. Idempotency is guaranteed by the unique
+(subscriber_id, post_url) constraint on notification_logs.
 """
 from __future__ import annotations
 
@@ -32,30 +33,56 @@ def run_cycle(dump_raw_keys: bool = False) -> None:
     apify_run_id: str | None = None
 
     try:
-        by_group = db.load_monitoring()
+        all_groups = db.load_monitoring()
+        if not all_groups:
+            log.info("No groups with alert-ready subscribers; nothing to do.")
+            run_id = db.start_engine_run(0)
+            db.finish_engine_run(run_id)
+            return
+
+        by_group, due_count, skipped = db.filter_due_groups(all_groups)
+        log.info(
+            "Cadence: %d due / %d total (%d not due yet)",
+            due_count,
+            len(all_groups),
+            skipped,
+        )
         if not by_group:
-            log.info("No groups with SMS-enabled subscribers; nothing to do.")
             run_id = db.start_engine_run(0)
             db.finish_engine_run(run_id)
             return
 
         group_urls = list(by_group.keys())
         run_id = db.start_engine_run(len(group_urls))
+        lookback = db.max_lookback_for_groups(by_group)
 
         # Index subscribers by numeric group id for robust post -> group matching.
+        # Match against all alert-ready watchers (not only due-cycle set) so a
+        # Free rider on a Lightning-forced scrape still gets email.
         subs_by_gid: dict[str, list[db.Subscriber]] = {}
-        for url, subs in by_group.items():
+        for url, subs in all_groups.items():
             gid = group_id(url)
             if gid:
                 subs_by_gid.setdefault(gid, []).extend(subs)
 
-        scrape_result = scrape(group_urls, dump_raw_keys=dump_raw_keys)
+        scrape_result = scrape(
+            group_urls, dump_raw_keys=dump_raw_keys, lookback=lookback
+        )
         posts = scrape_result.posts
         apify_run_id = scrape_result.apify_run_id
         posts_scraped = len(posts)
 
-        # Per-subscriber SMS sent this cycle (rate limit).
-        sms_sent_by_sub: dict[str, int] = {}
+        db.mark_groups_scraped(group_urls)
+
+        # Accumulate scrape results as a data asset (independent of matches).
+        db.upsert_scraped_posts(
+            posts,
+            engine_run_id=run_id,
+            apify_run_id=apify_run_id,
+        )
+
+        # Per-subscriber channel sends this cycle (rate limit).
+        sends_by_sub: dict[str, int] = {}
         max_per_sub = config.SMS_MAX_PER_SUBSCRIBER_PER_CYCLE
         delay_s = max(0, config.SMS_SEND_DELAY_MS) / 1000.0
 
@@ -65,21 +92,13 @@ def run_cycle(dump_raw_keys: bool = False) -> None:
                 keyword = matcher.first_match(post.text, sub.keywords)
                 if not keyword:
                     continue
-                # Idempotency guard: only proceed if this row is newly inserted.
                 notification_log_id = db.log_notification(sub.id, post.url, keyword)
                 if not notification_log_id:
                     continue
                 matches_found += 1
                 body = notifier.build_message(keyword, post.url)
 
-                if not sub.sms_enabled:
-                    skip_reason = (
-                        "no phone"
-                        if not sub.phone
-                        else "no sms consent"
-                        if not sub.sms_consent_at
-                        else "notify_sms off"
-                    )
+                if not sub.sms_ok and not sub.email_ok:
                     db.log_sendout(
                         subscriber_id=sub.id,
                         notification_log_id=notification_log_id,
@@ -89,16 +108,11 @@ def run_cycle(dump_raw_keys: bool = False) -> None:
                         post_url=post.url,
                         channel="simulated",
                         status="skipped",
-                        error=skip_reason,
-                    )
-                    log.info(
-                        "Logged match for %s but SMS suppressed (%s)",
-                        sub.id,
-                        skip_reason,
+                        error="no_alert_channel",
                     )
                     continue
 
-                already = sms_sent_by_sub.get(sub.id, 0)
+                already = sends_by_sub.get(sub.id, 0)
                 if max_per_sub > 0 and already >= max_per_sub:
                     db.log_sendout(
                         subscriber_id=sub.id,
@@ -111,34 +125,56 @@ def run_cycle(dump_raw_keys: bool = False) -> None:
                         status="skipped",
                         error="rate_limited_cycle",
                     )
-                    log.info(
-                        "Rate-limited SMS for %s (cap=%d/cycle)",
-                        sub.id,
-                        max_per_sub,
-                    )
                     continue
 
-                if delay_s > 0 and sent > 0:
-                    time.sleep(delay_s)
+                channel_sent = False
 
-                result = notifier.send(sub.phone, keyword, post.url)
-                db.log_sendout(
-                    subscriber_id=sub.id,
-                    notification_log_id=notification_log_id,
-                    phone=sub.phone,
-                    body=body,
-                    keyword=keyword,
-                    post_url=post.url,
-                    channel=result.channel,
-                    status=result.status,
-                    provider_message_id=result.provider_message_id,
-                    error=result.error,
-                )
-                if result.status == "sent":
-                    sent += 1
-                    sms_sent_by_sub[sub.id] = already + 1
+                if sub.sms_ok and sub.phone:
+                    if delay_s > 0 and sent > 0:
+                        time.sleep(delay_s)
+                    result = notifier.send(sub.phone, keyword, post.url)
+                    db.log_sendout(
+                        subscriber_id=sub.id,
+                        notification_log_id=notification_log_id,
+                        phone=sub.phone,
+                        body=body,
+                        keyword=keyword,
+                        post_url=post.url,
+                        channel=result.channel,
+                        status=result.status,
+                        provider_message_id=result.provider_message_id,
+                        error=result.error,
+                    )
+                    if result.status == "sent":
+                        sent += 1
+                        channel_sent = True
+
+                if sub.email_ok and sub.email:
+                    if delay_s > 0 and sent > 0:
+                        time.sleep(delay_s)
+                    email_body, _ = notifier.build_email_bodies(keyword, post.url)
+                    result = notifier.send_email_alert(sub.email, keyword, post.url)
+                    db.log_sendout(
+                        subscriber_id=sub.id,
+                        notification_log_id=notification_log_id,
+                        phone=sub.phone or "",
+                        body=email_body,
+                        keyword=keyword,
+                        post_url=post.url,
+                        channel=result.channel,
+                        status=result.status,
+                        provider_message_id=result.provider_message_id,
+                        error=result.error,
+                    )
+                    if result.status == "sent":
+                        sent += 1
+                        channel_sent = True
+
+                if channel_sent:
+                    sends_by_sub[sub.id] = already + 1
+
         log.info(
-            "Cycle complete: %d post(s) scraped, %d new match(es), %d SMS dispatched.",
+            "Cycle complete: %d post(s) scraped, %d new match(es), %d alert(s) dispatched.",
             posts_scraped,
             matches_found,
             sent,
@@ -174,11 +210,12 @@ def main() -> None:
     args = parser.parse_args()
 
     log.info(
-        "Starting engine (ENV=%s, project=%s, schema=%s, sms=%s)",
+        "Starting engine (ENV=%s, project=%s, schema=%s, sms=%s, resend=%s)",
         config.ENV,
         config.SUPABASE_URL,
         config.DB_SCHEMA,
         config.SMS_MODE,
+        "on" if config.RESEND_API_KEY else "outbox",
     )
 
     if args.once:

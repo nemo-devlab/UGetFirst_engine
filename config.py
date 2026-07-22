@@ -91,7 +91,24 @@ SMS_MAX_PER_SUBSCRIBER_PER_CYCLE = int(
 # Pause between Twilio/outbox sends in a cycle (Twilio 429 cushion). 0 = no delay.
 SMS_SEND_DELAY_MS = int(os.getenv("SMS_SEND_DELAY_MS", "250"))
 
+# Global loop tick (Lightning cadence). Per-group due filter uses TIER_POLL_SECONDS.
 MIN_INTERVAL_SECONDS = int(os.getenv("MIN_INTERVAL_SECONDS", "600"))
+
+# Plan tier → scrape interval (seconds). Fastest watcher on a group wins.
+TIER_POLL_SECONDS = {
+    "free": int(os.getenv("POLL_FREE_SECONDS", "1800")),
+    "speed": int(os.getenv("POLL_SPEED_SECONDS", "1200")),
+    "lightning": int(os.getenv("POLL_LIGHTNING_SECONDS", "600")),
+}
+# Extra minutes added to Apify lookback beyond the slowest due group's interval.
+LOOKBACK_BUFFER_MINUTES = int(os.getenv("LOOKBACK_BUFFER_MINUTES", "10"))
+
+# Resend for match email alerts (optional; falls back to outbox/).
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+ALERT_FROM_EMAIL = os.getenv(
+    "ALERT_FROM_EMAIL", "UGetFirst <alerts@ugetfirst.com>"
+).strip()
+
 # Per-group post cap. Total resultsLimit for an Apify run = max(RESULTS_LIMIT, groups * RESULTS_PER_GROUP).
 RESULTS_LIMIT = int(os.getenv("RESULTS_LIMIT", "20"))
 RESULTS_PER_GROUP = int(os.getenv("RESULTS_PER_GROUP", "10"))
@@ -101,12 +118,12 @@ APIFY_MAX_RETRIES = int(os.getenv("APIFY_MAX_RETRIES", "1"))
 
 # Time-based scrape window passed to the actor's `onlyPostsNewerThan`.
 # Prefer LOOKBACK ("10 minutes", "1 day"). LOOKBACK_MINUTES is accepted as a
-# convenience alias from older .env files.
+# convenience alias from older .env files. Cycle may override via max_lookback_for_groups.
 _lookback = os.getenv("LOOKBACK", "").strip()
 if not _lookback:
     _minutes = os.getenv("LOOKBACK_MINUTES", "").strip()
     if _minutes.isdigit():
         _lookback = f"{int(_minutes)} minutes"
     else:
-        _lookback = "1 day"
+        _lookback = "40 minutes"
 LOOKBACK = _lookback

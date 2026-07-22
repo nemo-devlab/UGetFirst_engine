@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from apify_client import ApifyClient
 
@@ -22,6 +23,8 @@ class Post:
     url: str
     text: str
     group_id: str | None
+    raw: dict
+    posted_at: str | None = None
 
 
 @dataclass
@@ -35,6 +38,7 @@ class ScrapeResult:
 _URL_FIELDS = ("facebookUrl", "url", "postUrl", "topLevelUrl", "link")
 _TEXT_FIELDS = ("text", "message", "postText", "content")
 _GROUP_FIELDS = ("groupUrl", "groupId", "facebookGroupUrl", "groupTitle")
+_TIME_FIELDS = ("time", "timestamp", "date", "createdAt", "publishedAt", "postedAt")
 
 
 def _first(item: dict, fields: tuple[str, ...]) -> str | None:
@@ -45,13 +49,32 @@ def _first(item: dict, fields: tuple[str, ...]) -> str | None:
     return None
 
 
+def _posted_at(item: dict) -> str | None:
+    """Best-effort ISO timestamp from Apify time fields (string or epoch ms/s)."""
+    for f in _TIME_FIELDS:
+        val = item.get(f)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, (int, float)) and val > 0:
+            # Apify sometimes returns epoch ms; treat large values as ms.
+            secs = val / 1000.0 if val > 1_000_000_000_000 else float(val)
+            return datetime.fromtimestamp(secs, tz=timezone.utc).isoformat()
+    return None
+
+
 def _normalize(item: dict) -> Post | None:
     url = _first(item, _URL_FIELDS)
     text = _first(item, _TEXT_FIELDS) or ""
     if not url:
         return None
     gid = group_id(_first(item, _GROUP_FIELDS)) or group_id(url)
-    return Post(url=url, text=text, group_id=gid)
+    return Post(
+        url=url,
+        text=text,
+        group_id=gid,
+        raw=item,
+        posted_at=_posted_at(item),
+    )
 
 
 def _dataset_id(run) -> str:
@@ -76,14 +99,20 @@ def _results_limit_for(group_count: int) -> int:
     return min(scaled, 500)
 
 
-def _call_actor(apify: ApifyClient, group_urls: list[str], dump_raw_keys: bool):
+def _call_actor(
+    apify: ApifyClient,
+    group_urls: list[str],
+    dump_raw_keys: bool,
+    lookback: str | None = None,
+):
+    lookback_val = lookback if lookback is not None else config.LOOKBACK
     run_input = {
         "startUrls": [{"url": u} for u in group_urls],
         "resultsLimit": _results_limit_for(len(group_urls)),
         "viewOption": "CHRONOLOGICAL",
     }
-    if config.LOOKBACK:
-        run_input["onlyPostsNewerThan"] = config.LOOKBACK
+    if lookback_val:
+        run_input["onlyPostsNewerThan"] = lookback_val
 
     last_exc: Exception | None = None
     attempts = 1 + max(0, config.APIFY_MAX_RETRIES)
@@ -93,7 +122,7 @@ def _call_actor(apify: ApifyClient, group_urls: list[str], dump_raw_keys: bool):
                 "Starting Apify actor for %d group(s) (limit=%d, lookback=%s, attempt=%d/%d)",
                 len(group_urls),
                 run_input["resultsLimit"],
-                config.LOOKBACK or "none",
+                lookback_val or "none",
                 attempt,
                 attempts,
             )
@@ -116,10 +145,14 @@ def _call_actor(apify: ApifyClient, group_urls: list[str], dump_raw_keys: bool):
     raise last_exc
 
 
-def scrape(group_urls: list[str], dump_raw_keys: bool = False) -> ScrapeResult:
+def scrape(
+    group_urls: list[str],
+    dump_raw_keys: bool = False,
+    lookback: str | None = None,
+) -> ScrapeResult:
     """Scrape recent posts for the given group URLs via batched actor runs.
 
-    Fetches posts within the LOOKBACK time window (newest-first, capped per
+    Fetches posts within the lookback time window (newest-first, capped per
     batch) and relies on the unique (subscriber_id, post_url) constraint on
     notification_logs to avoid re-notifying for posts we've already seen.
     """
@@ -135,7 +168,9 @@ def scrape(group_urls: list[str], dump_raw_keys: bool = False) -> ScrapeResult:
 
     for i in range(0, len(group_urls), batch_size):
         batch = group_urls[i : i + batch_size]
-        posts, run_id = _call_actor(apify, batch, dump_raw_keys=dump_raw_keys)
+        posts, run_id = _call_actor(
+            apify, batch, dump_raw_keys=dump_raw_keys, lookback=lookback
+        )
         all_posts.extend(posts)
         if run_id:
             run_ids.append(run_id)

@@ -1,12 +1,15 @@
 """Notification output.
 
-Sends via Twilio when TWILIO_* credentials are set and SMS_MODE is not
-"simulated". Otherwise writes one .txt file per message into outbox/.
+SMS via Twilio (or simulated outbox/). Email match alerts via Resend
+(or simulated email_*.txt outbox when RESEND_API_KEY is unset).
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,7 +29,7 @@ HELP_REPLY = (
 
 @dataclass
 class SendResult:
-    channel: str  # "twilio" | "simulated"
+    channel: str  # "twilio" | "simulated" | "resend" | "email"
     status: str  # "sent" | "failed"
     provider_message_id: str | None = None
     error: str | None = None
@@ -46,10 +49,30 @@ def build_message(keyword: str, post_url: str) -> str:
     )
 
 
-def _outbox_filename(phone: str, post_url: str) -> str:
+def build_email_subject(keyword: str) -> str:
+    return f'UGetFirst alert: "{keyword}" matched'
+
+
+def build_email_bodies(keyword: str, post_url: str) -> tuple[str, str]:
+    text = (
+        f'A new post matched your keyword "{keyword}".\n\n'
+        f"{post_url}\n\n"
+        "Manage alerts in your UGetFirst dashboard.\n"
+    )
+    html = (
+        f"<p>A new post matched your keyword <strong>{keyword}</strong>.</p>"
+        f'<p><a href="{post_url}">Open the Facebook post</a></p>'
+        "<p style=\"color:#737373;font-size:13px;\">"
+        "Manage alerts in your UGetFirst dashboard."
+        "</p>"
+    )
+    return text, html
+
+
+def _outbox_filename(dest: str, post_url: str, prefix: str = "") -> str:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    digest = hashlib.sha1(f"{phone}|{post_url}".encode()).hexdigest()[:10]
-    return f"{ts}_{digest}.txt"
+    digest = hashlib.sha1(f"{dest}|{post_url}".encode()).hexdigest()[:10]
+    return f"{prefix}{ts}_{digest}.txt"
 
 
 def _write_outbox(phone: str, keyword: str, post_url: str, body: str) -> None:
@@ -66,6 +89,23 @@ def _write_outbox(phone: str, keyword: str, post_url: str, body: str) -> None:
     )
     path.write_text(contents, encoding="utf-8")
     log.info("[SIMULATED SMS] wrote %s (to=%s, keyword=%s)", path.name, to, keyword)
+
+
+def _write_email_outbox(email: str, keyword: str, post_url: str, body: str) -> None:
+    OUTBOX_DIR.mkdir(exist_ok=True)
+    path = OUTBOX_DIR / _outbox_filename(email, post_url, prefix="email_")
+    contents = (
+        f"to: {email}\n"
+        f"keyword: {keyword}\n"
+        f"post_url: {post_url}\n"
+        f"time: {datetime.now(timezone.utc).isoformat()}\n"
+        "---\n"
+        f"{body}\n"
+    )
+    path.write_text(contents, encoding="utf-8")
+    log.info(
+        "[SIMULATED EMAIL] wrote %s (to=%s, keyword=%s)", path.name, email, keyword
+    )
 
 
 def _twilio_ready() -> bool:
@@ -112,3 +152,47 @@ def send(phone: str, keyword: str, post_url: str) -> SendResult:
             status="failed",
             error=str(exc)[:2000],
         )
+
+
+def send_email_alert(email: str, keyword: str, post_url: str) -> SendResult:
+    text, html = build_email_bodies(keyword, post_url)
+    subject = build_email_subject(keyword)
+
+    if not config.RESEND_API_KEY:
+        _write_email_outbox(email, keyword, post_url, text)
+        return SendResult(channel="email", status="sent")
+
+    payload = {
+        "from": config.ALERT_FROM_EMAIL,
+        "to": [email],
+        "subject": subject,
+        "text": text,
+        "html": html,
+    }
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {config.RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            data = json.loads(raw) if raw else {}
+            msg_id = data.get("id") if isinstance(data, dict) else None
+            log.info("[RESEND] id=%s to=%s keyword=%s", msg_id, email, keyword)
+            return SendResult(
+                channel="resend",
+                status="sent",
+                provider_message_id=msg_id,
+            )
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")[:2000]
+        log.error("Resend HTTP %s: %s", exc.code, err_body)
+        return SendResult(channel="resend", status="failed", error=err_body)
+    except Exception as exc:
+        log.exception("Resend send failed to=%s", email)
+        return SendResult(channel="resend", status="failed", error=str(exc)[:2000])
