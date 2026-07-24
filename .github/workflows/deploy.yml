@@ -1,0 +1,55 @@
+name: Deploy engine
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-dev:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ugetfirst-engine-dev
+      cancel-in-progress: false
+    steps:
+      - name: Deploy dev branch to DEV droplet
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ secrets.DEV_DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_SSH_USER }}
+          key: ${{ secrets.DEV_DROPLET_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            cd "$HOME/UGetFirst_engine"
+            git fetch origin dev
+            git switch dev
+            git pull --ff-only origin dev
+            "$HOME/UGetFirst_engine/.venv/bin/pip" install -r requirements.txt
+            bash deploy/restart.sh
+
+  deploy-prod:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ugetfirst-engine-prod
+      cancel-in-progress: false
+    steps:
+      - name: Deploy main branch to PROD droplet
+        uses: appleboy/ssh-action@v1.2.5
+        with:
+          host: ${{ secrets.PROD_DROPLET_HOST }}
+          username: ${{ secrets.DROPLET_SSH_USER }}
+          key: ${{ secrets.PROD_DROPLET_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            cd "$HOME/UGetFirst_engine"
+            git fetch origin main
+            git switch main
+            git pull --ff-only origin main
+            "$HOME/UGetFirst_engine/.venv/bin/pip" install -r requirements.txt
+            bash deploy/restart.sh

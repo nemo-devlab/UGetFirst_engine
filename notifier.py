@@ -41,6 +41,25 @@ def to_e164(phone: str) -> str:
     return "+" + digits
 
 
+def is_live_destination(channel: str, destination: str) -> bool:
+    """Return whether a provider call is allowed for this destination.
+
+    PROD sends normally. DEV fails closed: only the configured QA phone/email
+    can leave the process; all other destinations use the local outbox.
+    """
+    if config.ENV == "prod":
+        return True
+    if channel == "sms":
+        allowed = "".join(ch for ch in config.QA_TEST_PHONE if ch.isdigit())
+        actual = "".join(ch for ch in destination if ch.isdigit())
+        return bool(allowed and actual == allowed)
+    if channel == "email":
+        allowed = config.QA_TEST_EMAIL.strip().lower()
+        actual = destination.strip().lower()
+        return bool(allowed and actual == allowed)
+    raise ValueError(f"Unsupported notification channel: {channel!r}")
+
+
 def build_message(keyword: str, post_url: str) -> str:
     return (
         f'UGetFirst: "{keyword}" just posted in your group.\n'
@@ -120,7 +139,7 @@ def _twilio_ready() -> bool:
 def send(phone: str, keyword: str, post_url: str) -> SendResult:
     body = build_message(keyword, post_url)
 
-    if not _twilio_ready():
+    if not _twilio_ready() or not is_live_destination("sms", phone):
         _write_outbox(phone, keyword, post_url, body)
         return SendResult(channel="simulated", status="sent")
 
@@ -158,7 +177,7 @@ def send_email_alert(email: str, keyword: str, post_url: str) -> SendResult:
     text, html = build_email_bodies(keyword, post_url)
     subject = build_email_subject(keyword)
 
-    if not config.RESEND_API_KEY:
+    if not config.RESEND_API_KEY or not is_live_destination("email", email):
         _write_email_outbox(email, keyword, post_url, text)
         return SendResult(channel="email", status="sent")
 

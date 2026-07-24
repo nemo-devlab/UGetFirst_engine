@@ -109,6 +109,12 @@ ALERT_FROM_EMAIL = os.getenv(
     "ALERT_FROM_EMAIL", "UGetFirst <alerts@ugetfirst.com>"
 ).strip()
 
+# DEV live-send allowlist. In DEV, Twilio/Resend calls are permitted only for
+# these destinations; every other alert is written to outbox/. PROD ignores
+# the allowlist and keeps the normal live-send behavior.
+QA_TEST_EMAIL = os.getenv("QA_TEST_EMAIL", "").strip().lower()
+QA_TEST_PHONE = os.getenv("QA_TEST_PHONE", "").strip()
+
 # Per-group post cap. Total resultsLimit for an Apify run = max(RESULTS_LIMIT, groups * RESULTS_PER_GROUP).
 RESULTS_LIMIT = int(os.getenv("RESULTS_LIMIT", "20"))
 RESULTS_PER_GROUP = int(os.getenv("RESULTS_PER_GROUP", "10"))

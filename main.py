@@ -10,19 +10,140 @@ from __future__ import annotations
 import argparse
 import logging
 import time
+from dataclasses import dataclass
 
 import config
 import db
 import health
 import matcher
 import notifier
-from scraper import group_id, scrape
+from scraper import Post, group_id, scrape
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("ugetfirst")
+
+
+@dataclass
+class DispatchStats:
+    matches_found: int = 0
+    alerts_dispatched: int = 0
+
+
+def dispatch_posts(
+    posts: list[Post],
+    subscribers_by_group_id: dict[str, list[db.Subscriber]],
+    *,
+    channels: set[str] | None = None,
+) -> DispatchStats:
+    """Run the production match, dedup, notify, and sendout-log path.
+
+    ``channels`` is used only by the DEV test harness to request email, SMS, or
+    both. Normal engine cycles pass no filter.
+    """
+    if channels is not None and not channels <= {"sms", "email"}:
+        raise ValueError(f"Unsupported channel filter: {sorted(channels)!r}")
+
+    stats = DispatchStats()
+    sends_by_sub: dict[str, int] = {}
+    max_per_sub = config.SMS_MAX_PER_SUBSCRIBER_PER_CYCLE
+    delay_s = max(0, config.SMS_SEND_DELAY_MS) / 1000.0
+
+    for post in posts:
+        subs = subscribers_by_group_id.get(post.group_id or "", [])
+        for sub in subs:
+            keyword = matcher.first_match(post.text, sub.keywords)
+            if not keyword:
+                continue
+            notification_log_id = db.log_notification(sub.id, post.url, keyword)
+            if not notification_log_id:
+                continue
+            stats.matches_found += 1
+            body = notifier.build_message(keyword, post.url)
+
+            sms_selected = channels is None or "sms" in channels
+            email_selected = channels is None or "email" in channels
+            sms_ready = sms_selected and sub.sms_ok and bool(sub.phone)
+            email_ready = email_selected and sub.email_ok and bool(sub.email)
+
+            if not sms_ready and not email_ready:
+                db.log_sendout(
+                    subscriber_id=sub.id,
+                    notification_log_id=notification_log_id,
+                    phone=sub.phone or "",
+                    body=body,
+                    keyword=keyword,
+                    post_url=post.url,
+                    channel="simulated",
+                    status="skipped",
+                    error="no_alert_channel",
+                )
+                continue
+
+            already = sends_by_sub.get(sub.id, 0)
+            if max_per_sub > 0 and already >= max_per_sub:
+                db.log_sendout(
+                    subscriber_id=sub.id,
+                    notification_log_id=notification_log_id,
+                    phone=sub.phone or "",
+                    body=body,
+                    keyword=keyword,
+                    post_url=post.url,
+                    channel="simulated",
+                    status="skipped",
+                    error="rate_limited_cycle",
+                )
+                continue
+
+            channel_sent = False
+
+            if sms_ready and sub.phone:
+                if delay_s > 0 and stats.alerts_dispatched > 0:
+                    time.sleep(delay_s)
+                result = notifier.send(sub.phone, keyword, post.url)
+                db.log_sendout(
+                    subscriber_id=sub.id,
+                    notification_log_id=notification_log_id,
+                    phone=sub.phone,
+                    body=body,
+                    keyword=keyword,
+                    post_url=post.url,
+                    channel=result.channel,
+                    status=result.status,
+                    provider_message_id=result.provider_message_id,
+                    error=result.error,
+                )
+                if result.status == "sent":
+                    stats.alerts_dispatched += 1
+                    channel_sent = True
+
+            if email_ready and sub.email:
+                if delay_s > 0 and stats.alerts_dispatched > 0:
+                    time.sleep(delay_s)
+                email_body, _ = notifier.build_email_bodies(keyword, post.url)
+                result = notifier.send_email_alert(sub.email, keyword, post.url)
+                db.log_sendout(
+                    subscriber_id=sub.id,
+                    notification_log_id=notification_log_id,
+                    phone=sub.phone or "",
+                    body=email_body,
+                    keyword=keyword,
+                    post_url=post.url,
+                    channel=result.channel,
+                    status=result.status,
+                    provider_message_id=result.provider_message_id,
+                    error=result.error,
+                )
+                if result.status == "sent":
+                    stats.alerts_dispatched += 1
+                    channel_sent = True
+
+            if channel_sent:
+                sends_by_sub[sub.id] = already + 1
+
+    return stats
 
 
 def run_cycle(dump_raw_keys: bool = False) -> None:
@@ -81,97 +202,9 @@ def run_cycle(dump_raw_keys: bool = False) -> None:
             apify_run_id=apify_run_id,
         )
 
-        # Per-subscriber channel sends this cycle (rate limit).
-        sends_by_sub: dict[str, int] = {}
-        max_per_sub = config.SMS_MAX_PER_SUBSCRIBER_PER_CYCLE
-        delay_s = max(0, config.SMS_SEND_DELAY_MS) / 1000.0
-
-        for post in posts:
-            subs = subs_by_gid.get(post.group_id or "", [])
-            for sub in subs:
-                keyword = matcher.first_match(post.text, sub.keywords)
-                if not keyword:
-                    continue
-                notification_log_id = db.log_notification(sub.id, post.url, keyword)
-                if not notification_log_id:
-                    continue
-                matches_found += 1
-                body = notifier.build_message(keyword, post.url)
-
-                if not sub.sms_ok and not sub.email_ok:
-                    db.log_sendout(
-                        subscriber_id=sub.id,
-                        notification_log_id=notification_log_id,
-                        phone=sub.phone or "",
-                        body=body,
-                        keyword=keyword,
-                        post_url=post.url,
-                        channel="simulated",
-                        status="skipped",
-                        error="no_alert_channel",
-                    )
-                    continue
-
-                already = sends_by_sub.get(sub.id, 0)
-                if max_per_sub > 0 and already >= max_per_sub:
-                    db.log_sendout(
-                        subscriber_id=sub.id,
-                        notification_log_id=notification_log_id,
-                        phone=sub.phone or "",
-                        body=body,
-                        keyword=keyword,
-                        post_url=post.url,
-                        channel="simulated",
-                        status="skipped",
-                        error="rate_limited_cycle",
-                    )
-                    continue
-
-                channel_sent = False
-
-                if sub.sms_ok and sub.phone:
-                    if delay_s > 0 and sent > 0:
-                        time.sleep(delay_s)
-                    result = notifier.send(sub.phone, keyword, post.url)
-                    db.log_sendout(
-                        subscriber_id=sub.id,
-                        notification_log_id=notification_log_id,
-                        phone=sub.phone,
-                        body=body,
-                        keyword=keyword,
-                        post_url=post.url,
-                        channel=result.channel,
-                        status=result.status,
-                        provider_message_id=result.provider_message_id,
-                        error=result.error,
-                    )
-                    if result.status == "sent":
-                        sent += 1
-                        channel_sent = True
-
-                if sub.email_ok and sub.email:
-                    if delay_s > 0 and sent > 0:
-                        time.sleep(delay_s)
-                    email_body, _ = notifier.build_email_bodies(keyword, post.url)
-                    result = notifier.send_email_alert(sub.email, keyword, post.url)
-                    db.log_sendout(
-                        subscriber_id=sub.id,
-                        notification_log_id=notification_log_id,
-                        phone=sub.phone or "",
-                        body=email_body,
-                        keyword=keyword,
-                        post_url=post.url,
-                        channel=result.channel,
-                        status=result.status,
-                        provider_message_id=result.provider_message_id,
-                        error=result.error,
-                    )
-                    if result.status == "sent":
-                        sent += 1
-                        channel_sent = True
-
-                if channel_sent:
-                    sends_by_sub[sub.id] = already + 1
+        stats = dispatch_posts(posts, subs_by_gid)
+        matches_found = stats.matches_found
+        sent = stats.alerts_dispatched
 
         log.info(
             "Cycle complete: %d post(s) scraped, %d new match(es), %d alert(s) dispatched.",
