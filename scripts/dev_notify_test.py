@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -31,11 +32,11 @@ logging.basicConfig(
 log = logging.getLogger("ugetfirst.dev_notify_test")
 
 
-def _live_eligible_channels(sub: db.Subscriber) -> set[str]:
+def _eligible_test_channels(sub: db.Subscriber) -> set[str]:
     channels: set[str] = set()
-    if sub.sms_ok and sub.phone and notifier.is_live_destination("sms", sub.phone):
+    if sub.sms_ok and config.QA_TEST_PHONE:
         channels.add("sms")
-    if sub.email_ok and sub.email and notifier.is_live_destination("email", sub.email):
+    if sub.email_ok and config.QA_TEST_EMAIL:
         channels.add("email")
     return channels
 
@@ -44,8 +45,8 @@ def _required_channels(requested: str, eligible: set[str]) -> set[str]:
     if requested == "eligible":
         if not eligible:
             raise SystemExit(
-                "No live-eligible channel found. Ensure the DEV subscriber uses "
-                "QA_TEST_EMAIL/QA_TEST_PHONE and has notification consent enabled."
+                "No test-eligible channel found. Ensure QA_TEST_EMAIL/QA_TEST_PHONE "
+                "is configured and the selected subscriber has notification consent."
             )
         return eligible
     required = {"sms", "email"} if requested == "both" else {requested}
@@ -74,6 +75,9 @@ def _validate_provider_config(channels: set[str]) -> None:
 
 def _find_target(
     subscriber_id: str | None,
+    tier: str | None,
+    simulate_tier: str | None,
+    requested_channel: str,
 ) -> tuple[str, str, db.Subscriber, set[str]]:
     monitoring = db.load_monitoring()
     for group_url in sorted(monitoring):
@@ -83,13 +87,31 @@ def _find_target(
         for sub in sorted(monitoring[group_url], key=lambda item: item.id):
             if subscriber_id and sub.id != subscriber_id:
                 continue
-            eligible = _live_eligible_channels(sub)
-            if eligible:
-                return group_url, gid, sub, eligible
+            if tier and sub.effective_tier != tier:
+                continue
+            candidate = sub
+            if simulate_tier:
+                candidate = replace(
+                    sub,
+                    plan_tier=simulate_tier,
+                    plan_status="active",
+                    notify_sms=True,
+                    sms_consent_at=datetime.now(timezone.utc).isoformat(),
+                )
+            eligible = _eligible_test_channels(candidate)
+            required = (
+                {"sms", "email"}
+                if requested_channel == "both"
+                else {requested_channel}
+                if requested_channel != "eligible"
+                else set()
+            )
+            if eligible and required <= eligible:
+                return group_url, gid, candidate, eligible
     detail = f" with id {subscriber_id}" if subscriber_id else ""
     raise SystemExit(
-        f"No alert-ready allowlisted DEV subscriber{detail} was found in a "
-        "scrape-enabled monitored group."
+        f"No alert-ready DEV subscriber{detail} matching the requested tier/channel "
+        "was found in a scrape-enabled monitored group."
     )
 
 
@@ -105,14 +127,39 @@ def main() -> None:
         default="eligible",
         help="Channels to exercise while preserving real tier/consent rules.",
     )
+    parser.add_argument(
+        "--tier",
+        choices=("free", "speed", "lightning"),
+        help="Optionally require a subscriber with this effective tier.",
+    )
+    parser.add_argument(
+        "--simulate-tier",
+        choices=("speed", "lightning"),
+        help=(
+            "Use a controlled paid-tier fixture while preserving a real DEV "
+            "subscriber's keyword and monitored group."
+        ),
+    )
     args = parser.parse_args()
 
     if config.ENV != "dev":
         raise SystemExit("Refusing to run: dev_notify_test.py requires ENV=dev.")
+    if args.tier and args.simulate_tier:
+        parser.error("--tier and --simulate-tier cannot be used together")
 
-    group_url, gid, sub, eligible = _find_target(args.subscriber_id)
+    group_url, gid, sub, eligible = _find_target(
+        args.subscriber_id,
+        args.tier,
+        args.simulate_tier,
+        args.channel,
+    )
     channels = _required_channels(args.channel, eligible)
     _validate_provider_config(channels)
+    test_sub = replace(
+        sub,
+        phone=config.QA_TEST_PHONE if "sms" in channels else sub.phone,
+        email=config.QA_TEST_EMAIL if "email" in channels else sub.email,
+    )
 
     keyword = sub.keywords[0]
     now = datetime.now(timezone.utc)
@@ -137,7 +184,7 @@ def main() -> None:
         )
         stats = engine.dispatch_posts(
             [post],
-            {gid: [sub]},
+            {gid: [test_sub]},
             channels=channels,
         )
     except Exception as exc:

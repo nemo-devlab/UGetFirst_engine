@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   deploy-dev:
-    if: github.ref == 'refs/heads/dev'
+    if: github.ref == 'refs/heads/dev' && vars.DEV_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: ugetfirst-engine-dev
@@ -33,7 +33,7 @@ jobs:
             bash deploy/restart.sh
 
   deploy-prod:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && vars.PROD_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: ugetfirst-engine-prod

@@ -19,9 +19,10 @@ import argparse
 import logging
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 for _proxy_var in (
     "HTTP_PROXY",
@@ -46,6 +47,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("sync_prod_to_dev")
+T = TypeVar("T")
 
 PAGE = 1000
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
@@ -303,18 +305,61 @@ def build_auth_attrs(user: dict[str, Any], *, include_id: bool) -> dict[str, Any
     return attrs
 
 
-def auth_user_exists(dev: Client, user_id: str) -> bool:
-    try:
-        resp = dev.auth.admin.get_user_by_id(user_id)
-        return bool(getattr(resp, "user", None) or (isinstance(resp, dict) and resp.get("user")))
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "not found" in msg or "user not found" in msg:
-            return False
-        # Some GoTrue versions raise for missing users — treat as missing.
-        if "404" in msg:
-            return False
-        raise
+def fetch_auth_users(client: Client) -> list[Any]:
+    all_users: list[Any] = []
+    page = 1
+    per_page = 1000
+    while True:
+        users = auth_call(
+            client.auth.admin.list_users,
+            page=page,
+            per_page=per_page,
+        )
+        all_users.extend(users)
+        if len(users) < per_page:
+            break
+        page += 1
+    return all_users
+
+
+def _auth_value(user: Any, name: str) -> str:
+    value = getattr(user, name, None)
+    if value is None and isinstance(user, dict):
+        value = user.get(name)
+    return str(value or "").strip()
+
+
+def fetch_auth_user_ids(client: Client) -> set[str]:
+    return {
+        user_id
+        for user in fetch_auth_users(client)
+        if (user_id := _auth_value(user, "id"))
+    }
+
+
+def auth_call(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Retry the transient Auth JWT-key routing error seen after key rotation."""
+    attempts = 5
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            message = str(exc).lower()
+            transient = (
+                "invalid jwt" in message
+                and "unrecognized jwt kid" in message
+            )
+            if not transient or attempt == attempts:
+                raise
+            delay = min(8, 2 ** (attempt - 1))
+            log.warning(
+                "Transient Supabase Auth key error; retrying in %ds (%d/%d)",
+                delay,
+                attempt,
+                attempts,
+            )
+            time.sleep(delay)
+    raise RuntimeError("unreachable")
 
 
 def sync_auth_users(dev: Client, database_url: str, *, dry_run: bool) -> dict[str, int]:
@@ -348,20 +393,64 @@ def sync_auth_users(dev: Client, database_url: str, *, dry_run: bool) -> dict[st
     if dry_run:
         return stats
 
+    existing_users = fetch_auth_users(dev)
+    existing_ids = {
+        user_id
+        for user in existing_users
+        if (user_id := _auth_value(user, "id"))
+    }
+    ids_by_email = {
+        email.lower(): _auth_value(user, "id")
+        for user in existing_users
+        if (email := _auth_value(user, "email"))
+    }
+    ids_by_phone = {
+        phone: _auth_value(user, "id")
+        for user in existing_users
+        if (phone := _auth_value(user, "phone"))
+    }
+    failures: list[str] = []
     for user in candidates:
         try:
-            exists = auth_user_exists(dev, user["id"])
-            if exists:
-                dev.auth.admin.update_user_by_id(
+            if user["id"] in existing_ids:
+                auth_call(
+                    dev.auth.admin.update_user_by_id,
                     user["id"], build_auth_attrs(user, include_id=False)
                 )
                 stats["updated"] += 1
             else:
-                dev.auth.admin.create_user(build_auth_attrs(user, include_id=True))
+                email = (user.get("email") or "").strip().lower()
+                phone = (user.get("phone") or "").strip()
+                conflicts = {
+                    conflict_id
+                    for conflict_id in (
+                        ids_by_email.get(email) if email else None,
+                        ids_by_phone.get(phone) if phone else None,
+                    )
+                    if conflict_id and conflict_id != user["id"]
+                }
+                for conflict_id in conflicts:
+                    log.info(
+                        "  replacing DEV Auth user %s with PROD id %s",
+                        conflict_id,
+                        user["id"],
+                    )
+                    auth_call(dev.auth.admin.delete_user, conflict_id)
+                    existing_ids.discard(conflict_id)
+                auth_call(
+                    dev.auth.admin.create_user,
+                    build_auth_attrs(user, include_id=True),
+                )
                 stats["created"] += 1
+                existing_ids.add(user["id"])
+                if email:
+                    ids_by_email[email] = user["id"]
+                if phone:
+                    ids_by_phone[phone] = user["id"]
             stats["synced"] += 1
         except Exception as exc:
             stats["skipped"] += 1
+            failures.append(f"{user.get('id')}: {exc}")
             log.warning(
                 "  Auth skip %s (%s): %s",
                 user.get("id"),
@@ -375,6 +464,10 @@ def sync_auth_users(dev: Client, database_url: str, *, dry_run: bool) -> dict[st
         stats["updated"],
         stats["skipped"],
     )
+    if failures:
+        raise RuntimeError(
+            "Auth sync failed; DEV tables were not modified: " + "; ".join(failures)
+        )
     return stats
 
 
@@ -454,6 +547,17 @@ def main() -> None:
 
     log.info("Syncing Auth users (password hashes) PROD → DEV…")
     sync_auth_users(dev, prod_database_url, dry_run=False)
+    required_user_ids = {
+        str(row["user_id"])
+        for row in prod_data.get("subscribers", [])
+        if row.get("user_id")
+    }
+    missing_user_ids = required_user_ids - fetch_auth_user_ids(dev)
+    if missing_user_ids:
+        raise RuntimeError(
+            "Auth preflight failed; DEV tables were not modified. Missing user IDs: "
+            + ", ".join(sorted(missing_user_ids))
+        )
 
     log.info("Wiping DEV child and history tables…")
     for table in WIPE_TABLES:

@@ -194,6 +194,7 @@ def send_email_alert(email: str, keyword: str, post_url: str) -> SendResult:
         headers={
             "Authorization": f"Bearer {config.RESEND_API_KEY}",
             "Content-Type": "application/json",
+            "User-Agent": "UGetFirst-Engine/1.0",
         },
         method="POST",
     )
