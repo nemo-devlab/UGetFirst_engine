@@ -44,6 +44,42 @@ class LiveDestinationTests(unittest.TestCase):
                 notifier.is_live_destination("email", "qa@example.com")
             )
 
+    def test_dev_send_forces_simulated_for_non_qa_phone(self) -> None:
+        with (
+            patch.object(config, "ENV", "dev"),
+            patch.object(config, "SMS_MODE", "twilio"),
+            patch.object(config, "TWILIO_ACCOUNT_SID", "sid"),
+            patch.object(config, "TWILIO_AUTH_TOKEN", "token"),
+            patch.object(config, "TWILIO_FROM_NUMBER", "+15550000000"),
+            patch.object(config, "QA_TEST_PHONE", "+15550001111"),
+            patch.object(notifier, "_write_outbox") as write_outbox,
+            patch.dict("sys.modules", {"twilio.rest": object()}),
+        ):
+            result = notifier.send(
+                "15550009999", "plumber", "https://example.com/post"
+            )
+        self.assertEqual(result.channel, "simulated")
+        self.assertEqual(result.status, "sent")
+        write_outbox.assert_called_once()
+
+    def test_dev_email_forces_simulated_for_non_qa_address(self) -> None:
+        with (
+            patch.object(config, "ENV", "dev"),
+            patch.object(config, "RESEND_API_KEY", "re_test"),
+            patch.object(config, "QA_TEST_EMAIL", "qa@example.com"),
+            patch.object(notifier, "_write_email_outbox") as write_outbox,
+            patch.object(notifier.urllib.request, "urlopen") as urlopen,
+        ):
+            result = notifier.send_email_alert(
+                "customer@example.com",
+                "plumber",
+                "https://example.com/post",
+            )
+        self.assertEqual(result.channel, "simulated")
+        self.assertEqual(result.status, "sent")
+        write_outbox.assert_called_once()
+        urlopen.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

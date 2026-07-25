@@ -7,6 +7,7 @@ public (no token) so deploy checks and uptime monitors keep working.
 
 POST /admin/start|stop|restart control ugetfirst-engine (token required).
 POST /admin/env {"env":"prod"|"dev"} updates .env ENV and restarts if running.
+POST /admin/notify-test sends a QA notification on DEV (token required).
 Install deploy/sudoers-ugetfirst-engine on the VPS for passwordless systemctl.
 """
 from __future__ import annotations
@@ -18,6 +19,7 @@ import subprocess
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Lock
 from urllib.parse import parse_qs, urlparse
 
 import config
@@ -27,6 +29,7 @@ log = logging.getLogger("ugetfirst.health")
 HEARTBEAT_PATH = Path(__file__).resolve().parent / ".engine-heartbeat"
 ENV_FILE_PATH = Path(__file__).resolve().parent / ".env"
 ENGINE_UNIT = "ugetfirst-engine"
+_notify_test_lock = Lock()
 
 
 def _write_heartbeat(at: datetime) -> None:
@@ -257,6 +260,14 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        body = json.loads(raw.decode("utf-8") or "{}")
+        if not isinstance(body, dict):
+            raise ValueError("JSON body must be an object")
+        return body
+
     def do_GET(self) -> None:
         # / and /health stay public so deploy curls and DO uptime monitors work
         # even when ENGINE_ADMIN_TOKEN / HEALTH_TOKEN is set. Admin POSTs stay gated.
@@ -299,12 +310,83 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
         route = urlparse(self.path).path.rstrip("/") or "/"
 
-        if route == "/admin/env":
-            length = int(self.headers.get("Content-Length", "0") or "0")
-            raw = self.rfile.read(length) if length > 0 else b"{}"
+        if route == "/admin/notify-test":
+            if not _admin_token():
+                self._send_json(
+                    503,
+                    {
+                        "ok": False,
+                        "error": "ENGINE_ADMIN_TOKEN is required for notification tests.",
+                    },
+                )
+                return
             try:
-                body = json.loads(raw.decode("utf-8") or "{}")
-            except json.JSONDecodeError:
+                body = self._read_json_body()
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                self._send_json(400, {"ok": False, "error": "invalid JSON"})
+                return
+
+            channel = str(body.get("channel", "")).strip().lower()
+            if channel not in {"email", "sms", "both"}:
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error": "channel must be email, sms, or both",
+                    },
+                )
+                return
+            if read_configured_env() != "dev" or config.ENV != "dev":
+                self._send_json(
+                    403,
+                    {
+                        "ok": False,
+                        "error": "Notification tests are allowed only on DEV.",
+                    },
+                )
+                return
+            if not _notify_test_lock.acquire(blocking=False):
+                self._send_json(
+                    409,
+                    {
+                        "ok": False,
+                        "error": "A notification test is already running.",
+                    },
+                )
+                return
+
+            try:
+                from scripts.dev_notify_test import run_notification_test
+
+                result = run_notification_test(
+                    requested_channel=channel,
+                    simulate_tier="speed" if channel in {"sms", "both"} else None,
+                )
+            except (SystemExit, ValueError) as exc:
+                log.warning("Admin notification test rejected: %s", exc)
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            except Exception:
+                log.exception("Admin notification test failed")
+                self._send_json(
+                    500,
+                    {
+                        "ok": False,
+                        "error": "Notification test failed. Check DEV engine logs.",
+                    },
+                )
+                return
+            finally:
+                _notify_test_lock.release()
+
+            log.info("Admin notification test sent via %s", channel)
+            self._send_json(200, result)
+            return
+
+        if route == "/admin/env":
+            try:
+                body = self._read_json_body()
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
                 self._send_json(400, {"ok": False, "error": "invalid JSON"})
                 return
             target = str(body.get("env", "")).strip().lower()

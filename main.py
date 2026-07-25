@@ -127,7 +127,8 @@ def dispatch_posts(
                 db.log_sendout(
                     subscriber_id=sub.id,
                     notification_log_id=notification_log_id,
-                    phone=sub.phone or "",
+                    # Store the actual email destination (sms_sendouts has no email column).
+                    phone=sub.email,
                     body=email_body,
                     keyword=keyword,
                     post_url=post.url,
