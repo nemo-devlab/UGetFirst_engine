@@ -163,8 +163,10 @@ def run_notification_test(
 
     keyword = sub.keywords[0]
     now = datetime.now(timezone.utc)
+    # Match production shape: Facebook group permalink (synthetic id for QA only).
+    permalink_id = uuid4().int % 10**16
     post = Post(
-        url=f"https://dev.ugetfirst.com/test-notification/{uuid4()}",
+        url=f"https://www.facebook.com/groups/{gid}/permalink/{permalink_id}/",
         text=f"DEV notification pipeline test containing keyword: {keyword}",
         group_id=gid,
         raw={
@@ -217,7 +219,8 @@ def run_notification_test(
         previews["email"] = {
             "subject": notifier.build_email_subject(keyword),
             "text": email_text,
-            "html": email_html,
+            # Admin iframe can't resolve cid: — swap to data URI for preview.
+            "html": notifier.html_with_previewable_logo(email_html),
         }
     if "sms" in channels:
         previews["sms"] = {"body": notifier.build_message(keyword, post.url)}

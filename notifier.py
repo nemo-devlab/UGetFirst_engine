@@ -5,6 +5,7 @@ SMS via Twilio (or simulated outbox/). Email match alerts via Resend
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -19,6 +20,11 @@ import config
 log = logging.getLogger("ugetfirst.notifier")
 
 OUTBOX_DIR = Path(__file__).resolve().parent / "outbox"
+LOGO_MARK_PATH = Path(__file__).resolve().parent / "assets" / "logo-mark.png"
+LOGO_CID = "ugetfirst-logo"
+DASHBOARD_URL = "https://ugetfirst.com/dashboard"
+# Hosted fallback for clients/previews; live sends also embed via CID.
+LOGO_URL = "https://ugetfirst.com/email/logo-mark.png"
 
 HELP_REPLY = (
     "UGetFirst: Job alert texts when keywords match in your watched Facebook "
@@ -68,9 +74,6 @@ def build_message(keyword: str, post_url: str) -> str:
     )
 
 
-DASHBOARD_URL = "https://ugetfirst.com/dashboard"
-
-
 def build_email_subject(keyword: str) -> str:
     return f'UGetFirst alert: "{keyword}" matched'
 
@@ -84,17 +87,45 @@ def _html_escape(value: str) -> str:
     )
 
 
+def _logo_mark_base64() -> str | None:
+    if not LOGO_MARK_PATH.is_file():
+        return None
+    return base64.b64encode(LOGO_MARK_PATH.read_bytes()).decode("ascii")
+
+
+def _logo_attachment() -> dict[str, str] | None:
+    content = _logo_mark_base64()
+    if not content:
+        log.warning("Email logo mark missing at %s", LOGO_MARK_PATH)
+        return None
+    return {
+        "filename": "logo-mark.png",
+        "content": content,
+        "content_type": "image/png",
+        "content_id": LOGO_CID,
+    }
+
+
+def html_with_previewable_logo(html: str) -> str:
+    """Swap cid: logo refs for a data URI so admin iframes can render it."""
+    content = _logo_mark_base64()
+    if not content:
+        return html.replace(f"cid:{LOGO_CID}", LOGO_URL)
+    return html.replace(f"cid:{LOGO_CID}", f"data:image/png;base64,{content}")
+
+
 def _brand_header_html() -> str:
-    """Inline-styled wordmark matching UGetFirst_web (Lucide Zap mark + UGetFirst)."""
-    return """
+    """Wordmark matching UGetFirst_web: green mark + Lucide Zap PNG + UGetFirst."""
+    # Prefer CID so Gmail/etc. don't strip SVG; hosted URL is alt text fallback only.
+    return f"""
         <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;">
           <tr>
             <td style="vertical-align:middle;padding-right:10px;">
-              <div style="width:32px;height:32px;background:#00C805;border-radius:8px;box-shadow:0 4px 12px -2px rgba(0,200,5,0.45);">
-                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="#ffffff" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:8px;">
-                  <path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z" />
-                </svg>
-              </div>
+              <img src="cid:{LOGO_CID}"
+                   width="32"
+                   height="32"
+                   alt="UGetFirst"
+                   style="display:block;width:32px;height:32px;border:0;outline:none;text-decoration:none;border-radius:8px;" />
             </td>
             <td style="vertical-align:middle;font-size:20px;font-weight:800;letter-spacing:-0.02em;color:#171717;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
               UGet<span style="color:#00C805;">First</span>
@@ -281,6 +312,9 @@ def send_email_alert(email: str, keyword: str, post_url: str) -> SendResult:
         "text": text,
         "html": html,
     }
+    logo = _logo_attachment()
+    if logo:
+        payload["attachments"] = [logo]
     req = urllib.request.Request(
         "https://api.resend.com/emails",
         data=json.dumps(payload).encode("utf-8"),
