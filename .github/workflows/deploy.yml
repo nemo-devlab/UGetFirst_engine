@@ -28,7 +28,6 @@ jobs:
             cd "$HOME/UGetFirst_engine"
             git fetch origin dev
             git checkout -f -B dev origin/dev
-            git clean -fd
             "$HOME/UGetFirst_engine/.venv/bin/pip" install -r requirements.txt
             bash deploy/restart.sh
 
@@ -50,6 +49,5 @@ jobs:
             cd "$HOME/UGetFirst_engine"
             git fetch origin main
             git checkout -f -B main origin/main
-            git clean -fd
             "$HOME/UGetFirst_engine/.venv/bin/pip" install -r requirements.txt
             bash deploy/restart.sh

@@ -10,6 +10,10 @@ set -euo pipefail
 REPO="${REPO:-$HOME/UGetFirst_engine}"
 cd "$REPO"
 
+HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:8080/health}"
+# Cold start (imports + bind + mark_engine_started) often exceeds a few seconds.
+HEALTH_WAIT_SECONDS="${HEALTH_WAIT_SECONDS:-90}"
+
 echo "==> restarting ugetfirst-engine and ugetfirst-health"
 sudo systemctl restart ugetfirst-health
 sudo systemctl restart ugetfirst-engine
@@ -21,13 +25,26 @@ echo
 systemctl status ugetfirst-engine --no-pager -l || true
 
 echo
-echo "==> health check (waiting 3s)"
-sleep 3
-if curl -sf "http://127.0.0.1:8080/health"; then
-  echo
-  echo "OK"
-else
-  echo
-  echo "WARN: /health did not return 200 yet (engine may still be starting)"
-  exit 1
-fi
+echo "==> health check (up to ${HEALTH_WAIT_SECONDS}s)"
+deadline=$((SECONDS + HEALTH_WAIT_SECONDS))
+while (( SECONDS < deadline )); do
+  if curl -sf "$HEALTH_URL" >/dev/null; then
+    echo
+    echo "OK"
+    exit 0
+  fi
+  sleep 2
+done
+
+echo
+echo "ERROR: /health did not return 200 within ${HEALTH_WAIT_SECONDS}s"
+echo
+echo "==> last /health response"
+curl -si "$HEALTH_URL" || true
+echo
+echo "==> recent health journal"
+journalctl -u ugetfirst-health -n 40 --no-pager || true
+echo
+echo "==> recent engine journal"
+journalctl -u ugetfirst-engine -n 40 --no-pager || true
+exit 1
