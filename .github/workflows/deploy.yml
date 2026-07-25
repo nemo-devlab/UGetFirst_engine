@@ -27,8 +27,7 @@ jobs:
             set -euo pipefail
             cd "$HOME/UGetFirst_engine"
             git fetch origin dev
-            git switch dev
-            git pull --ff-only origin dev
+            git checkout -f -B dev origin/dev
             "$HOME/UGetFirst_engine/.venv/bin/pip" install -r requirements.txt
             bash deploy/restart.sh
 
@@ -49,7 +48,6 @@ jobs:
             set -euo pipefail
             cd "$HOME/UGetFirst_engine"
             git fetch origin main
-            git switch main
-            git pull --ff-only origin main
+            git checkout -f -B main origin/main
             "$HOME/UGetFirst_engine/.venv/bin/pip" install -r requirements.txt
             bash deploy/restart.sh
