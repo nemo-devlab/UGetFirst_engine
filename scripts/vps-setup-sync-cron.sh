@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install (or refresh) the daily PROD→DEV sync cron for the ugetfirst user.
+# Install (or refresh) the weekly PROD→DEV sync cron for the ugetfirst user.
 # Prefer this when passwordless sudo/systemd is unavailable.
 #
 # Usage (on the VPS):
@@ -23,10 +23,10 @@ if [[ ! -f "$SCRIPT" ]]; then
 fi
 
 MARKER="sync_prod_to_dev.py"
-LINE="0 0 * * * cd $REPO && $PY $SCRIPT --apply >> $LOG_DIR/sync_prod_to_dev.log 2>&1"
+LINE="0 0 * * 0 cd $REPO && $PY $SCRIPT --apply >> $LOG_DIR/sync_prod_to_dev.log 2>&1"
 
 (crontab -l 2>/dev/null | grep -v "$MARKER" || true
- echo "# Daily PROD → DEV Supabase overwrite at 00:00 UTC"
+ echo "# Weekly PROD → DEV Supabase overwrite, Sunday 00:00 UTC"
  echo "$LINE"
 ) | crontab -
 

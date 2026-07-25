@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Mirror account/catalog tables + Auth users from PROD → DEV.
+"""Mirror PROD into DEV with a seven-day window for high-volume history.
 
-Large volume / asset tables are excluded from wipe and copy (each env keeps
-its own history):
-  notification_logs, sms_sendouts, engine_runs, scraped_posts
-
-Subscribers and facebook_groups are upserted (not wiped) so CASCADE does not
-erase excluded child rows that still reference surviving UUIDs.
+Account, catalog, verification, feedback, and QA tables are fully mirrored.
+Auth users (including password hashes) are synchronized first. High-volume
+engine history keeps only the most recent seven days in DEV.
 
 Preserves row UUIDs so FK relationships stay intact. Auth users (with password
 hashes) are synced first via PROD_DATABASE_URL so subscribers.user_id stays
@@ -22,8 +19,10 @@ import argparse
 import logging
 import os
 import sys
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 for _proxy_var in (
     "HTTP_PROXY",
@@ -48,37 +47,63 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("sync_prod_to_dev")
+T = TypeVar("T")
 
 PAGE = 1000
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
+HISTORY_DAYS = 7
 
-# Never wipe or copy — high volume / data assets stay per-environment.
-SKIP_TABLES = (
-    "notification_logs",
-    "sms_sendouts",
-    "engine_runs",
-    "scraped_posts",
-)
-
-# Upsert parents (avoids CASCADE wipe of SKIP_TABLES).
+# Parent insert order. Upserts preserve IDs while child tables are rebuilt.
 UPSERT_TABLES = [
+    "locations",
     "subscribers",
     "facebook_groups",
 ]
 
-# Wipe + re-insert children (safe; no large logs).
-WIPE_COPY_TABLES = [
+# Full snapshots copied in FK-safe order.
+FULL_COPY_TABLES = [
     "keywords",
     "monitored_groups",
     "onboarding",
     "email_verifications",
+    "phone_verifications",
+    "group_requests",
+    "group_request_votes",
+    "feedback",
+    "qa_check_results",
 ]
 
-# Fetch order for dry-run counts / apply payload.
-COPY_TABLES = UPSERT_TABLES + WIPE_COPY_TABLES
+# High-volume history copied in FK-safe order with a timestamp cutoff.
+HISTORY_TABLES = {
+    "engine_runs": "started_at",
+    "notification_logs": "created_at",
+    "sms_sendouts": "created_at",
+    "scraped_posts": "scraped_at",
+}
 
-# Wipe order: children before any parent orphan cleanup.
-WIPE_TABLES = list(WIPE_COPY_TABLES)
+# Wipe deepest children first. All keys are non-null.
+WIPE_TABLES = [
+    "sms_sendouts",
+    "scraped_posts",
+    "notification_logs",
+    "engine_runs",
+    "group_request_votes",
+    "group_requests",
+    "phone_verifications",
+    "email_verifications",
+    "onboarding",
+    "monitored_groups",
+    "keywords",
+    "feedback",
+    "qa_check_results",
+]
+TABLE_KEY_COLUMNS = {
+    "group_request_votes": "request_id",
+    "qa_check_results": "check_id",
+}
+
+COPY_TABLES = UPSERT_TABLES + FULL_COPY_TABLES + list(HISTORY_TABLES)
+ORPHAN_DELETE_ORDER = ["subscribers", "facebook_groups", "locations"]
 
 AUTH_SELECT = """
   SELECT
@@ -117,19 +142,20 @@ def make_client(url: str, key: str) -> Client:
     return create_client(url, key)
 
 
-def fetch_all(client: Client, table: str) -> list[dict]:
+def fetch_all(
+    client: Client,
+    table: str,
+    *,
+    since_column: str | None = None,
+    since_value: str | None = None,
+) -> list[dict]:
     out: list[dict] = []
     start = 0
     while True:
-        rows = (
-            client.schema("public")
-            .table(table)
-            .select("*")
-            .range(start, start + PAGE - 1)
-            .execute()
-            .data
-            or []
-        )
+        query = client.schema("public").table(table).select("*")
+        if since_column and since_value:
+            query = query.gte(since_column, since_value)
+        rows = query.range(start, start + PAGE - 1).execute().data or []
         out.extend(rows)
         if len(rows) < PAGE:
             break
@@ -160,8 +186,9 @@ def fetch_ids(client: Client, table: str) -> set[str]:
 
 
 def table_exists(client: Client, table: str) -> bool:
+    key = TABLE_KEY_COLUMNS.get(table, "id")
     try:
-        client.schema("public").table(table).select("id").limit(1).execute()
+        client.schema("public").table(table).select(key).limit(1).execute()
         return True
     except Exception as exc:
         if "42P01" in str(exc) or "does not exist" in str(exc).lower():
@@ -177,7 +204,9 @@ def wipe_table(client: Client, table: str) -> None:
     if not table_exists(client, table):
         log.info("  skip wipe %s (missing)", table)
         return
-    client.schema("public").table(table).delete().neq("id", NIL_UUID).execute()
+    key = TABLE_KEY_COLUMNS.get(table, "id")
+    sentinel = "__ugetfirst_never_matches__" if key == "check_id" else NIL_UUID
+    client.schema("public").table(table).delete().neq(key, sentinel).execute()
     log.info("  wiped %s", table)
 
 
@@ -203,6 +232,22 @@ def delete_orphans(client: Client, table: str, keep_ids: set[str]) -> int:
     if orphans:
         log.info("  removed %d orphan %s row(s)", len(orphans), table)
     return len(orphans)
+
+
+def clear_out_of_window_history_references(data: dict[str, list[dict]]) -> None:
+    """Null references whose parent fell just outside the history cutoff."""
+    notification_ids = {
+        row["id"] for row in data.get("notification_logs", []) if row.get("id")
+    }
+    engine_run_ids = {
+        row["id"] for row in data.get("engine_runs", []) if row.get("id")
+    }
+    for row in data.get("sms_sendouts", []):
+        if row.get("notification_log_id") not in notification_ids:
+            row["notification_log_id"] = None
+    for row in data.get("scraped_posts", []):
+        if row.get("engine_run_id") not in engine_run_ids:
+            row["engine_run_id"] = None
 
 
 def fetch_prod_auth_users(database_url: str) -> list[dict[str, Any]]:
@@ -260,18 +305,61 @@ def build_auth_attrs(user: dict[str, Any], *, include_id: bool) -> dict[str, Any
     return attrs
 
 
-def auth_user_exists(dev: Client, user_id: str) -> bool:
-    try:
-        resp = dev.auth.admin.get_user_by_id(user_id)
-        return bool(getattr(resp, "user", None) or (isinstance(resp, dict) and resp.get("user")))
-    except Exception as exc:
-        msg = str(exc).lower()
-        if "not found" in msg or "user not found" in msg:
-            return False
-        # Some GoTrue versions raise for missing users — treat as missing.
-        if "404" in msg:
-            return False
-        raise
+def fetch_auth_users(client: Client) -> list[Any]:
+    all_users: list[Any] = []
+    page = 1
+    per_page = 1000
+    while True:
+        users = auth_call(
+            client.auth.admin.list_users,
+            page=page,
+            per_page=per_page,
+        )
+        all_users.extend(users)
+        if len(users) < per_page:
+            break
+        page += 1
+    return all_users
+
+
+def _auth_value(user: Any, name: str) -> str:
+    value = getattr(user, name, None)
+    if value is None and isinstance(user, dict):
+        value = user.get(name)
+    return str(value or "").strip()
+
+
+def fetch_auth_user_ids(client: Client) -> set[str]:
+    return {
+        user_id
+        for user in fetch_auth_users(client)
+        if (user_id := _auth_value(user, "id"))
+    }
+
+
+def auth_call(fn: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Retry the transient Auth JWT-key routing error seen after key rotation."""
+    attempts = 5
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            message = str(exc).lower()
+            transient = (
+                "invalid jwt" in message
+                and "unrecognized jwt kid" in message
+            )
+            if not transient or attempt == attempts:
+                raise
+            delay = min(8, 2 ** (attempt - 1))
+            log.warning(
+                "Transient Supabase Auth key error; retrying in %ds (%d/%d)",
+                delay,
+                attempt,
+                attempts,
+            )
+            time.sleep(delay)
+    raise RuntimeError("unreachable")
 
 
 def sync_auth_users(dev: Client, database_url: str, *, dry_run: bool) -> dict[str, int]:
@@ -305,20 +393,64 @@ def sync_auth_users(dev: Client, database_url: str, *, dry_run: bool) -> dict[st
     if dry_run:
         return stats
 
+    existing_users = fetch_auth_users(dev)
+    existing_ids = {
+        user_id
+        for user in existing_users
+        if (user_id := _auth_value(user, "id"))
+    }
+    ids_by_email = {
+        email.lower(): _auth_value(user, "id")
+        for user in existing_users
+        if (email := _auth_value(user, "email"))
+    }
+    ids_by_phone = {
+        phone: _auth_value(user, "id")
+        for user in existing_users
+        if (phone := _auth_value(user, "phone"))
+    }
+    failures: list[str] = []
     for user in candidates:
         try:
-            exists = auth_user_exists(dev, user["id"])
-            if exists:
-                dev.auth.admin.update_user_by_id(
+            if user["id"] in existing_ids:
+                auth_call(
+                    dev.auth.admin.update_user_by_id,
                     user["id"], build_auth_attrs(user, include_id=False)
                 )
                 stats["updated"] += 1
             else:
-                dev.auth.admin.create_user(build_auth_attrs(user, include_id=True))
+                email = (user.get("email") or "").strip().lower()
+                phone = (user.get("phone") or "").strip()
+                conflicts = {
+                    conflict_id
+                    for conflict_id in (
+                        ids_by_email.get(email) if email else None,
+                        ids_by_phone.get(phone) if phone else None,
+                    )
+                    if conflict_id and conflict_id != user["id"]
+                }
+                for conflict_id in conflicts:
+                    log.info(
+                        "  replacing DEV Auth user %s with PROD id %s",
+                        conflict_id,
+                        user["id"],
+                    )
+                    auth_call(dev.auth.admin.delete_user, conflict_id)
+                    existing_ids.discard(conflict_id)
+                auth_call(
+                    dev.auth.admin.create_user,
+                    build_auth_attrs(user, include_id=True),
+                )
                 stats["created"] += 1
+                existing_ids.add(user["id"])
+                if email:
+                    ids_by_email[email] = user["id"]
+                if phone:
+                    ids_by_phone[phone] = user["id"]
             stats["synced"] += 1
         except Exception as exc:
             stats["skipped"] += 1
+            failures.append(f"{user.get('id')}: {exc}")
             log.warning(
                 "  Auth skip %s (%s): %s",
                 user.get("id"),
@@ -332,6 +464,10 @@ def sync_auth_users(dev: Client, database_url: str, *, dry_run: bool) -> dict[st
         stats["updated"],
         stats["skipped"],
     )
+    if failures:
+        raise RuntimeError(
+            "Auth sync failed; DEV tables were not modified: " + "; ".join(failures)
+        )
     return stats
 
 
@@ -356,23 +492,38 @@ def main() -> None:
 
     prod = make_client(config.PROD_SUPABASE_URL, config.PROD_SUPABASE_SERVICE_ROLE_KEY)
     dev = make_client(config.DEV_SUPABASE_URL, config.DEV_SUPABASE_SERVICE_ROLE_KEY)
+    if config.PROD_SUPABASE_URL.rstrip("/") == config.DEV_SUPABASE_URL.rstrip("/"):
+        raise SystemExit("Refusing to sync: PROD and DEV Supabase URLs are identical")
 
+    cutoff = datetime.now(timezone.utc) - timedelta(days=HISTORY_DAYS)
+    cutoff_iso = cutoff.isoformat()
     prod_data: dict[str, list[dict]] = {}
     for table in COPY_TABLES:
-        if not table_exists(prod, table):
+        prod_exists = table_exists(prod, table)
+        dev_exists = table_exists(dev, table)
+        if prod_exists and not dev_exists:
+            raise SystemExit(
+                f"DEV table missing: {table}. Apply pending migrations to DEV first."
+            )
+        if not prod_exists:
             log.warning("PROD table missing: %s", table)
             prod_data[table] = []
             continue
-        rows = fetch_all(prod, table)
+        history_column = HISTORY_TABLES.get(table)
+        rows = fetch_all(
+            prod,
+            table,
+            since_column=history_column,
+            since_value=cutoff_iso if history_column else None,
+        )
         prod_data[table] = rows
-        log.info("PROD %s: %d row(s)", table, len(rows))
+        suffix = f" since {cutoff_iso}" if history_column else ""
+        log.info("PROD %s: %d row(s)%s", table, len(rows), suffix)
+
+    clear_out_of_window_history_references(prod_data)
 
     log.info(
-        "Skip (no wipe/copy): %s",
-        ", ".join(SKIP_TABLES),
-    )
-    log.info(
-        "Would wipe DEV: %s; upsert: %s; then copy children",
+        "Would wipe DEV children/history: %s; upsert parents: %s",
         ", ".join(WIPE_TABLES),
         ", ".join(UPSERT_TABLES),
     )
@@ -388,38 +539,62 @@ def main() -> None:
 
     if args.dry_run:
         log.info(
-            "Dry-run only. Re-run with --apply to overwrite DEV account/catalog + Auth."
+            "Dry-run only. Re-run with --apply to overwrite DEV with the PROD "
+            "%d-day mirror.",
+            HISTORY_DAYS,
         )
         return
 
     log.info("Syncing Auth users (password hashes) PROD → DEV…")
     sync_auth_users(dev, prod_database_url, dry_run=False)
+    required_user_ids = {
+        str(row["user_id"])
+        for row in prod_data.get("subscribers", [])
+        if row.get("user_id")
+    }
+    missing_user_ids = required_user_ids - fetch_auth_user_ids(dev)
+    if missing_user_ids:
+        raise RuntimeError(
+            "Auth preflight failed; DEV tables were not modified. Missing user IDs: "
+            + ", ".join(sorted(missing_user_ids))
+        )
 
-    log.info("Wiping DEV child tables…")
+    log.info("Wiping DEV child and history tables…")
     for table in WIPE_TABLES:
         wipe_table(dev, table)
 
     log.info("Upserting PROD parents → DEV…")
     for table in UPSERT_TABLES:
         rows = prod_data.get(table, [])
-        if not rows:
-            continue
-        upsert_batch(dev, table, rows)
-        log.info("  upserted %d row(s) into %s", len(rows), table)
+        if rows:
+            upsert_batch(dev, table, rows)
+            log.info("  upserted %d row(s) into %s", len(rows), table)
+
+    log.info("Removing DEV parent rows absent from PROD…")
+    for table in ORPHAN_DELETE_ORDER:
+        rows = prod_data.get(table, [])
         keep = {r["id"] for r in rows if r.get("id")}
         delete_orphans(dev, table, keep)
 
-    log.info("Copying PROD children → DEV…")
-    for table in WIPE_COPY_TABLES:
+    log.info("Copying full PROD snapshots → DEV…")
+    for table in FULL_COPY_TABLES:
         rows = prod_data.get(table, [])
         if not rows:
             continue
         insert_batch(dev, table, rows)
         log.info("  copied %d row(s) into %s", len(rows), table)
 
+    log.info("Copying recent PROD history → DEV…")
+    for table in HISTORY_TABLES:
+        rows = prod_data.get(table, [])
+        if not rows:
+            continue
+        insert_batch(dev, table, rows)
+        log.info("  copied %d recent row(s) into %s", len(rows), table)
+
     log.info(
-        "Done. DEV account/catalog + Auth mirror PROD; skipped %s.",
-        ", ".join(SKIP_TABLES),
+        "Done. DEV mirrors PROD accounts/Auth plus the most recent %d days of history.",
+        HISTORY_DAYS,
     )
 
 

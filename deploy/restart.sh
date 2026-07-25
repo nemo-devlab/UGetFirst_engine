@@ -16,9 +16,9 @@ sudo systemctl restart ugetfirst-engine
 
 echo
 echo "==> service status"
-sudo systemctl status ugetfirst-health --no-pager -l
+systemctl status ugetfirst-health --no-pager -l || true
 echo
-sudo systemctl status ugetfirst-engine --no-pager -l
+systemctl status ugetfirst-engine --no-pager -l || true
 
 echo
 echo "==> health check (waiting 3s)"

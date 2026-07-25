@@ -1,9 +1,9 @@
 [Unit]
-Description=Daily PROD → DEV Supabase sync at midnight UTC
+Description=Weekly PROD → DEV Supabase sync
 
 [Timer]
-# Midnight UTC every day
-OnCalendar=*-*-* 00:00:00 UTC
+# Sunday at midnight UTC
+OnCalendar=Sun *-*-* 00:00:00 UTC
 Persistent=true
 RandomizedDelaySec=60
 
