@@ -5,7 +5,9 @@ dataset item into a small, stable Post shape the rest of the app relies on.
 """
 from __future__ import annotations
 
+import base64
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,19 +35,139 @@ class ScrapeResult:
     apify_run_id: str | None
 
 
-# Locked field order from live Apify facebook-groups-scraper runs.
-# Prefer facebookUrl / text / groupUrl; keep fallbacks for actor version drift.
-_URL_FIELDS = ("facebookUrl", "url", "postUrl", "topLevelUrl", "link")
+# Apify facebook-groups-scraper: `facebookUrl` is the *group* page; `url` is the
+# post permalink. Prefer post fields, then rebuild from group id + post id.
+_POST_URL_FIELDS = ("url", "postUrl", "topLevelUrl", "permalink", "link")
+_GROUP_URL_FIELDS = ("facebookUrl", "groupUrl", "facebookGroupUrl", "inputUrl")
+_GROUP_ID_FIELDS = ("facebookId", "groupId", *_GROUP_URL_FIELDS)
+_POST_ID_FIELDS = ("legacyId", "postId", "post_id")
 _TEXT_FIELDS = ("text", "message", "postText", "content")
-_GROUP_FIELDS = ("groupUrl", "groupId", "facebookGroupUrl", "groupTitle")
 _TIME_FIELDS = ("time", "timestamp", "date", "createdAt", "publishedAt", "postedAt")
+
+_POST_PATH_RE = re.compile(
+    r"/groups/[^/]+/(?:posts|permalink)/(\d+)",
+    re.IGNORECASE,
+)
+_GROUP_SEGMENT_RE = re.compile(r"/groups/([^/?#]+)", re.IGNORECASE)
+_ENCODED_POST_ID_RE = re.compile(r"(?:feedback:|VK:)(\d+)", re.IGNORECASE)
+_RESERVED_GROUP_SEGMENTS = frozenset({"posts", "permalink", "members", "media"})
 
 
 def _first(item: dict, fields: tuple[str, ...]) -> str | None:
     for f in fields:
         val = item.get(f)
         if isinstance(val, str) and val.strip():
-            return val
+            return val.strip()
+    return None
+
+
+def _is_post_permalink(url: str | None) -> bool:
+    if not url:
+        return False
+    return bool(_POST_PATH_RE.search(url))
+
+
+def _post_id_from_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    m = _POST_PATH_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _decode_embedded_post_id(value: str) -> str | None:
+    """Extract numeric post id from Apify feedbackId / opaque id blobs."""
+    text = value.strip()
+    m = _ENCODED_POST_ID_RE.search(text)
+    if m:
+        return m.group(1)
+    # feedbackId is often base64("feedback:<postId>")
+    try:
+        padded = text + "=" * (-len(text) % 4)
+        decoded = base64.b64decode(padded, validate=False).decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+    m = _ENCODED_POST_ID_RE.search(decoded)
+    return m.group(1) if m else None
+
+
+def _post_id_from_item(item: dict) -> str | None:
+    for field in _POST_ID_FIELDS:
+        val = item.get(field)
+        if isinstance(val, int) and val > 0:
+            return str(val)
+        if isinstance(val, str) and val.strip().isdigit():
+            return val.strip()
+
+    for field in (*_POST_URL_FIELDS, *_GROUP_URL_FIELDS):
+        pid = _post_id_from_url(item.get(field) if isinstance(item.get(field), str) else None)
+        if pid:
+            return pid
+
+    for field in ("feedbackId", "id"):
+        val = item.get(field)
+        if isinstance(val, str) and val.strip():
+            pid = _decode_embedded_post_id(val)
+            if pid:
+                return pid
+    return None
+
+
+def _resolve_group_id(item: dict) -> str | None:
+    """Numeric Facebook group id used for subscriber matching."""
+    for field in _GROUP_ID_FIELDS:
+        val = item.get(field)
+        if isinstance(val, int) and val > 0:
+            return str(val)
+        if isinstance(val, str) and val.strip():
+            gid = group_id(val.strip())
+            if gid:
+                return gid
+    for field in _POST_URL_FIELDS:
+        val = item.get(field)
+        if isinstance(val, str) and val.strip():
+            gid = group_id(val.strip())
+            if gid:
+                return gid
+    return None
+
+
+def _group_path_segment(item: dict) -> str | None:
+    """Group path segment for permalink rebuild (numeric id or slug)."""
+    gid = _resolve_group_id(item)
+    if gid:
+        return gid
+    for field in (*_GROUP_URL_FIELDS, *_POST_URL_FIELDS):
+        val = item.get(field)
+        if not isinstance(val, str) or not val.strip():
+            continue
+        m = _GROUP_SEGMENT_RE.search(val.strip())
+        if not m:
+            continue
+        segment = m.group(1)
+        if segment.lower() not in _RESERVED_GROUP_SEGMENTS:
+            return segment
+    return None
+
+
+def _rebuild_post_url(item: dict) -> str | None:
+    """Return a direct post permalink, rebuilding when Apify only gave a group URL."""
+    for field in _POST_URL_FIELDS:
+        candidate = item.get(field)
+        if isinstance(candidate, str) and _is_post_permalink(candidate.strip()):
+            return candidate.strip().rstrip("/") + "/"
+
+    segment = _group_path_segment(item)
+    post_id = _post_id_from_item(item)
+    if segment and post_id:
+        return f"https://www.facebook.com/groups/{segment}/posts/{post_id}/"
+
+    # Last resort: any URL field that already looks like a post permalink
+    # (including a mistakenly post-shaped facebookUrl).
+    for field in (*_POST_URL_FIELDS, *_GROUP_URL_FIELDS):
+        candidate = item.get(field)
+        if isinstance(candidate, str) and _is_post_permalink(candidate.strip()):
+            return candidate.strip().rstrip("/") + "/"
+
     return None
 
 
@@ -63,11 +185,15 @@ def _posted_at(item: dict) -> str | None:
 
 
 def _normalize(item: dict) -> Post | None:
-    url = _first(item, _URL_FIELDS)
+    url = _rebuild_post_url(item)
     text = _first(item, _TEXT_FIELDS) or ""
     if not url:
+        log.warning(
+            "Skipping Apify item without rebuildable post URL (keys=%s)",
+            sorted(item.keys()),
+        )
         return None
-    gid = group_id(_first(item, _GROUP_FIELDS)) or group_id(url)
+    gid = _resolve_group_id(item) or group_id(url)
     return Post(
         url=url,
         text=text,
