@@ -2,7 +2,8 @@
 
 The engine writes a heartbeat file after each successful cycle. A separate
 `ugetfirst-health.service` (or the embedded server) reads it and exposes
-GET /health on HEALTH_PORT (default 8080).
+GET /health on HEALTH_PORT (default 8080). GET / and /health are always
+public (no token) so deploy checks and uptime monitors keep working.
 
 POST /admin/start|stop|restart control ugetfirst-engine (token required).
 POST /admin/env {"env":"prod"|"dev"} updates .env ENV and restarts if running.
@@ -257,12 +258,8 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self) -> None:
-        if not _authorized(self.path, self._header_map()):
-            self.send_response(401)
-            self.end_headers()
-            self.wfile.write(b"unauthorized\n")
-            return
-
+        # / and /health stay public so deploy curls and DO uptime monitors work
+        # even when ENGINE_ADMIN_TOKEN / HEALTH_TOKEN is set. Admin POSTs stay gated.
         parsed = urlparse(self.path)
         route = parsed.path.rstrip("/") or "/"
         if route not in ("/", "/health"):

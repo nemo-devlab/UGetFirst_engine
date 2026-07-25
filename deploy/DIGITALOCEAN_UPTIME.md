@@ -56,8 +56,10 @@ Optional `.env`:
 
 ```env
 HEALTH_PORT=8080
-HEALTH_TOKEN=long-random-string   # append ?token=... to monitor URL
-ENGINE_ADMIN_TOKEN=long-random-string   # admin dashboard restart + JSON health
+# Optional: protect admin APIs only. GET /health stays public for monitors/deploy.
+ENGINE_ADMIN_TOKEN=long-random-string
+# Legacy alias also accepted for admin auth:
+# HEALTH_TOKEN=long-random-string
 ```
 
 Admin dashboard (`UGetFirst_admin`) uses `ENGINE_HEALTH_URL` and `ENGINE_ADMIN_TOKEN`
