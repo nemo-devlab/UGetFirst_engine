@@ -4,6 +4,9 @@
 The script skips Apify by creating one synthetic post containing a real DEV
 subscriber keyword. It still uses production matching, deduplication, tier
 eligibility, provider sending, and database sendout logging.
+
+Live provider calls are only allowed to QA_TEST_EMAIL / QA_TEST_PHONE. The
+fixture never keeps a real member's phone or email attached.
 """
 from __future__ import annotations
 
@@ -115,51 +118,48 @@ def _find_target(
     )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--subscriber-id",
-        help="Optional DEV subscriber UUID. Defaults to the first allowlisted subscriber.",
-    )
-    parser.add_argument(
-        "--channel",
-        choices=("eligible", "sms", "email", "both"),
-        default="eligible",
-        help="Channels to exercise while preserving real tier/consent rules.",
-    )
-    parser.add_argument(
-        "--tier",
-        choices=("free", "speed", "lightning"),
-        help="Optionally require a subscriber with this effective tier.",
-    )
-    parser.add_argument(
-        "--simulate-tier",
-        choices=("speed", "lightning"),
-        help=(
-            "Use a controlled paid-tier fixture while preserving a real DEV "
-            "subscriber's keyword and monitored group."
-        ),
-    )
-    args = parser.parse_args()
-
+def run_notification_test(
+    *,
+    requested_channel: str = "eligible",
+    subscriber_id: str | None = None,
+    tier: str | None = None,
+    simulate_tier: str | None = None,
+) -> dict[str, object]:
+    """Send one synthetic match through the real DEV notification pipeline."""
+    if requested_channel not in {"eligible", "sms", "email", "both"}:
+        raise ValueError("channel must be eligible, sms, email, or both")
     if config.ENV != "dev":
         raise SystemExit("Refusing to run: dev_notify_test.py requires ENV=dev.")
-    if args.tier and args.simulate_tier:
-        parser.error("--tier and --simulate-tier cannot be used together")
+    if tier and simulate_tier:
+        raise ValueError("tier and simulate_tier cannot be used together")
 
     group_url, gid, sub, eligible = _find_target(
-        args.subscriber_id,
-        args.tier,
-        args.simulate_tier,
-        args.channel,
+        subscriber_id,
+        tier,
+        simulate_tier,
+        requested_channel,
     )
-    channels = _required_channels(args.channel, eligible)
+    channels = _required_channels(requested_channel, eligible)
     _validate_provider_config(channels)
+
+    # Never attach a real member's contact info to a live-send fixture.
     test_sub = replace(
         sub,
-        phone=config.QA_TEST_PHONE if "sms" in channels else sub.phone,
-        email=config.QA_TEST_EMAIL if "email" in channels else sub.email,
+        phone=config.QA_TEST_PHONE if "sms" in channels else "",
+        email=config.QA_TEST_EMAIL if "email" in channels else "",
     )
+    if "sms" in channels and not notifier.is_live_destination(
+        "sms", test_sub.phone
+    ):
+        raise SystemExit(
+            "Refusing live SMS test: QA_TEST_PHONE is missing or not allowlisted."
+        )
+    if "email" in channels and not notifier.is_live_destination(
+        "email", test_sub.email
+    ):
+        raise SystemExit(
+            "Refusing live email test: QA_TEST_EMAIL is missing or not allowlisted."
+        )
 
     keyword = sub.keywords[0]
     now = datetime.now(timezone.utc)
@@ -211,10 +211,58 @@ def main() -> None:
             f"expected={len(channels)}. Check provider logs and DEV sendout rows."
         )
 
+    return {
+        "ok": True,
+        "message": (
+            "DEV notification test sent via "
+            f"{', '.join(sorted(channels))}."
+        ),
+        "channels": sorted(channels),
+        "tier": sub.effective_tier,
+        "matches": stats.matches_found,
+        "dispatched": stats.alerts_dispatched,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--subscriber-id",
+        help="Optional DEV subscriber UUID. Defaults to the first allowlisted subscriber.",
+    )
+    parser.add_argument(
+        "--channel",
+        choices=("eligible", "sms", "email", "both"),
+        default="eligible",
+        help="Channels to exercise while preserving real tier/consent rules.",
+    )
+    parser.add_argument(
+        "--tier",
+        choices=("free", "speed", "lightning"),
+        help="Optionally require a subscriber with this effective tier.",
+    )
+    parser.add_argument(
+        "--simulate-tier",
+        choices=("speed", "lightning"),
+        help=(
+            "Use a controlled paid-tier fixture while preserving a real DEV "
+            "subscriber's keyword and monitored group."
+        ),
+    )
+    args = parser.parse_args()
+    if args.tier and args.simulate_tier:
+        parser.error("--tier and --simulate-tier cannot be used together")
+
+    result = run_notification_test(
+        requested_channel=args.channel,
+        subscriber_id=args.subscriber_id,
+        tier=args.tier,
+        simulate_tier=args.simulate_tier,
+    )
     log.info(
         "DEV notification test passed for tier=%s via %s",
-        sub.effective_tier,
-        ", ".join(sorted(channels)),
+        result["tier"],
+        ", ".join(result["channels"]),
     )
 
 

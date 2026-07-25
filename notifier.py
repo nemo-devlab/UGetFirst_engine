@@ -138,8 +138,15 @@ def _twilio_ready() -> bool:
 
 def send(phone: str, keyword: str, post_url: str) -> SendResult:
     body = build_message(keyword, post_url)
+    live = is_live_destination("sms", phone)
 
-    if not _twilio_ready() or not is_live_destination("sms", phone):
+    # DEV fail-closed: never call Twilio unless destination is the QA allowlist.
+    if not _twilio_ready() or not live:
+        if config.ENV != "prod" and not live:
+            log.warning(
+                "[DEV BLOCKED SMS] non-QA destination forced to simulated (to=%s)",
+                to_e164(phone) if phone else "(empty)",
+            )
         _write_outbox(phone, keyword, post_url, body)
         return SendResult(channel="simulated", status="sent")
 
@@ -176,10 +183,17 @@ def send(phone: str, keyword: str, post_url: str) -> SendResult:
 def send_email_alert(email: str, keyword: str, post_url: str) -> SendResult:
     text, html = build_email_bodies(keyword, post_url)
     subject = build_email_subject(keyword)
+    live = is_live_destination("email", email)
 
-    if not config.RESEND_API_KEY or not is_live_destination("email", email):
+    # DEV fail-closed: never call Resend unless destination is the QA allowlist.
+    if not config.RESEND_API_KEY or not live:
+        if config.ENV != "prod" and not live:
+            log.warning(
+                "[DEV BLOCKED EMAIL] non-QA destination forced to simulated (to=%s)",
+                email or "(empty)",
+            )
         _write_email_outbox(email, keyword, post_url, text)
-        return SendResult(channel="email", status="sent")
+        return SendResult(channel="simulated", status="sent")
 
     payload = {
         "from": config.ALERT_FROM_EMAIL,
