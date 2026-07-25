@@ -70,6 +70,18 @@ class DevNotifyTestTests(unittest.TestCase):
         self.assertEqual(dispatch.call_args.kwargs["channels"], {"email", "sms"})
         self.assertEqual(result["channels"], ["email", "sms"])
         self.assertEqual(result["dispatched"], 2)
+        previews = result["previews"]
+        assert isinstance(previews, dict)
+        self.assertIn("email", previews)
+        self.assertIn("sms", previews)
+        email_preview = previews["email"]
+        assert isinstance(email_preview, dict)
+        self.assertIn("UGetFirst", email_preview["html"])
+        self.assertIn("#00C805", email_preview["html"])
+        self.assertIn("plumber", email_preview["html"])
+        sms_preview = previews["sms"]
+        assert isinstance(sms_preview, dict)
+        self.assertIn("plumber", sms_preview["body"])
 
     def test_email_only_clears_real_member_phone(self) -> None:
         stats = main.DispatchStats(matches_found=1, alerts_dispatched=1)

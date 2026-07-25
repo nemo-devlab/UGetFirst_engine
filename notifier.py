@@ -68,8 +68,39 @@ def build_message(keyword: str, post_url: str) -> str:
     )
 
 
+DASHBOARD_URL = "https://ugetfirst.com/dashboard"
+
+
 def build_email_subject(keyword: str) -> str:
     return f'UGetFirst alert: "{keyword}" matched'
+
+
+def _html_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _brand_header_html() -> str:
+    """Inline-styled wordmark matching UGetFirst_web (Lucide Zap mark + UGetFirst)."""
+    return """
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 auto;">
+          <tr>
+            <td style="vertical-align:middle;padding-right:10px;">
+              <div style="width:32px;height:32px;background:#00C805;border-radius:8px;box-shadow:0 4px 12px -2px rgba(0,200,5,0.45);">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="#ffffff" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="display:block;margin:8px;">
+                  <path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z" />
+                </svg>
+              </div>
+            </td>
+            <td style="vertical-align:middle;font-size:20px;font-weight:800;letter-spacing:-0.02em;color:#171717;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+              UGet<span style="color:#00C805;">First</span>
+            </td>
+          </tr>
+        </table>"""
 
 
 def build_email_bodies(keyword: str, post_url: str) -> tuple[str, str]:
@@ -77,14 +108,62 @@ def build_email_bodies(keyword: str, post_url: str) -> tuple[str, str]:
         f'A new post matched your keyword "{keyword}".\n\n'
         f"{post_url}\n\n"
         "Manage alerts in your UGetFirst dashboard.\n"
+        f"{DASHBOARD_URL}\n"
     )
-    html = (
-        f"<p>A new post matched your keyword <strong>{keyword}</strong>.</p>"
-        f'<p><a href="{post_url}">Open the Facebook post</a></p>'
-        "<p style=\"color:#737373;font-size:13px;\">"
-        "Manage alerts in your UGetFirst dashboard."
-        "</p>"
-    )
+    safe_keyword = _html_escape(keyword)
+    safe_url = _html_escape(post_url)
+    html = f"""<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>UGetFirst alert</title>
+  </head>
+  <body style="margin:0;padding:0;background:#f5f5f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f5f5f5;">
+      <tr>
+        <td align="center" style="padding:32px 16px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:480px;background:#ffffff;border:1px solid #e5e5e5;border-radius:20px;overflow:hidden;">
+            <tr>
+              <td style="height:4px;background:#00C805;font-size:0;line-height:0;">&nbsp;</td>
+            </tr>
+            <tr>
+              <td style="padding:32px 28px 28px;text-align:center;">
+                {_brand_header_html()}
+                <p style="margin:28px 0 0;font-size:13px;font-weight:700;letter-spacing:0.06em;text-transform:uppercase;color:#00A804;">
+                  Keyword match
+                </p>
+                <p style="margin:10px 0 0;font-size:22px;font-weight:800;line-height:1.3;color:#171717;letter-spacing:-0.02em;">
+                  &ldquo;{safe_keyword}&rdquo;
+                </p>
+                <p style="margin:14px 0 0;font-size:15px;line-height:1.55;color:#525252;">
+                  A new post in your watched Facebook group just matched this keyword.
+                </p>
+                <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:28px auto 0;">
+                  <tr>
+                    <td style="border-radius:14px;background:#00C805;box-shadow:0 8px 24px -6px rgba(0,200,5,0.45);">
+                      <a href="{safe_url}"
+                         style="display:inline-block;padding:14px 28px;font-size:16px;font-weight:700;color:#ffffff;text-decoration:none;border-radius:14px;">
+                        Open post
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+                <p style="margin:28px 0 0;padding-top:20px;border-top:1px solid #f0f0f0;font-size:13px;line-height:1.5;color:#a3a3a3;">
+                  Manage alerts in your
+                  <a href="{DASHBOARD_URL}" style="color:#00A804;font-weight:600;text-decoration:none;">UGetFirst dashboard</a>.
+                </p>
+              </td>
+            </tr>
+          </table>
+          <p style="margin:20px 0 0;font-size:12px;color:#a3a3a3;">
+            You&rsquo;re receiving this because email alerts are on for your account.
+          </p>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>"""
     return text, html
 
 

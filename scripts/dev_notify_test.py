@@ -211,6 +211,17 @@ def run_notification_test(
             f"expected={len(channels)}. Check provider logs and DEV sendout rows."
         )
 
+    previews: dict[str, object] = {}
+    if "email" in channels:
+        email_text, email_html = notifier.build_email_bodies(keyword, post.url)
+        previews["email"] = {
+            "subject": notifier.build_email_subject(keyword),
+            "text": email_text,
+            "html": email_html,
+        }
+    if "sms" in channels:
+        previews["sms"] = {"body": notifier.build_message(keyword, post.url)}
+
     return {
         "ok": True,
         "message": (
@@ -221,6 +232,7 @@ def run_notification_test(
         "tier": sub.effective_tier,
         "matches": stats.matches_found,
         "dispatched": stats.alerts_dispatched,
+        "previews": previews,
     }
 
 
