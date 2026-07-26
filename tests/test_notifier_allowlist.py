@@ -18,8 +18,17 @@ class LiveDestinationTests(unittest.TestCase):
             patch.object(config, "ENV", "dev"),
             patch.object(config, "QA_TEST_PHONE", "+1 (555) 000-1111"),
         ):
+            # Users store 10 digits without +1; QA may include country code.
+            self.assertTrue(notifier.is_live_destination("sms", "5550001111"))
             self.assertTrue(notifier.is_live_destination("sms", "15550001111"))
+            self.assertTrue(notifier.is_live_destination("sms", "+15550001111"))
             self.assertFalse(notifier.is_live_destination("sms", "+15550002222"))
+            self.assertFalse(notifier.is_live_destination("sms", "5550002222"))
+
+    def test_to_e164_adds_us_country_code_for_10_digits(self) -> None:
+        self.assertEqual(notifier.to_e164("5550001111"), "+15550001111")
+        self.assertEqual(notifier.to_e164("+1 (555) 000-1111"), "+15550001111")
+        self.assertEqual(notifier.to_e164("15550001111"), "+15550001111")
 
     def test_dev_allows_only_case_insensitive_qa_email(self) -> None:
         with (

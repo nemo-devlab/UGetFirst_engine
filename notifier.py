@@ -41,10 +41,23 @@ class SendResult:
     error: str | None = None
 
 
-def to_e164(phone: str) -> str:
-    """Subscribers store digits only (e.g. 15551234567); render as +E.164."""
+def phone_digits(phone: str) -> str:
+    """Canonical digits for storage/compare.
+
+    Users sign up with a 10-digit US number and never type +1. Treat bare
+    10-digit values as US (+1) so QA allowlist and Twilio E.164 stay aligned
+    whether the value is ``7373209527``, ``17373209527``, or ``+17373209527``.
+    """
     digits = "".join(ch for ch in phone if ch.isdigit())
-    return "+" + digits
+    if len(digits) == 10:
+        return "1" + digits
+    return digits
+
+
+def to_e164(phone: str) -> str:
+    """Render a subscriber phone as +E.164 for Twilio."""
+    digits = phone_digits(phone)
+    return f"+{digits}" if digits else ""
 
 
 def is_live_destination(channel: str, destination: str) -> bool:
@@ -56,8 +69,8 @@ def is_live_destination(channel: str, destination: str) -> bool:
     if config.ENV == "prod":
         return True
     if channel == "sms":
-        allowed = "".join(ch for ch in config.QA_TEST_PHONE if ch.isdigit())
-        actual = "".join(ch for ch in destination if ch.isdigit())
+        allowed = phone_digits(config.QA_TEST_PHONE)
+        actual = phone_digits(destination)
         return bool(allowed and actual == allowed)
     if channel == "email":
         allowed = config.QA_TEST_EMAIL.strip().lower()
