@@ -36,7 +36,7 @@ class HealthAuthTests(unittest.TestCase):
             "engine_active": True,
             "cycle_ok": True,
             "env": "dev",
-            "min_interval_seconds": 600,
+            "min_interval_seconds": 300,
             "last_success_at": datetime.now(timezone.utc).isoformat(),
             "last_success_seconds_ago": 1.0,
             "stale_after_seconds": 1500.0,

@@ -12,7 +12,7 @@ separate Supabase projects** (schema is always `public` in both).
 ```
 loop (every MIN_INTERVAL_SECONDS tick, non-overlapping):
   1. load groups with ≥1 alert-ready subscriber (+ keywords)  (db.py)
-  2. filter to due groups (Free 30m / Speed 20m / Lightning 10m)
+  2. filter to due groups (Free 30m / Speed 10m / Lightning 5m)
   3. scrape due URLs (batched Apify; LOOKBACK from max due interval)
   4. stamp facebook_groups.last_scraped_at
   5. upsert posts into scraped_posts (data asset)             (db.py)
@@ -58,7 +58,7 @@ DEV_SUPABASE_SERVICE_ROLE_KEY=
 
 APIFY_TOKEN=
 APIFY_ACTOR_ID=apify/facebook-groups-scraper
-MIN_INTERVAL_SECONDS=600
+MIN_INTERVAL_SECONDS=300
 RESULTS_LIMIT=20
 # Time window for scraping, e.g. "10 minutes", "6 hours", "1 day". Empty = off.
 LOOKBACK=30 minutes

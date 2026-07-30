@@ -92,13 +92,13 @@ SMS_MAX_PER_SUBSCRIBER_PER_CYCLE = int(
 SMS_SEND_DELAY_MS = int(os.getenv("SMS_SEND_DELAY_MS", "250"))
 
 # Global loop tick (Lightning cadence). Per-group due filter uses TIER_POLL_SECONDS.
-MIN_INTERVAL_SECONDS = int(os.getenv("MIN_INTERVAL_SECONDS", "600"))
+MIN_INTERVAL_SECONDS = int(os.getenv("MIN_INTERVAL_SECONDS", "300"))
 
 # Plan tier → scrape interval (seconds). Fastest watcher on a group wins.
 TIER_POLL_SECONDS = {
     "free": int(os.getenv("POLL_FREE_SECONDS", "1800")),
-    "speed": int(os.getenv("POLL_SPEED_SECONDS", "1200")),
-    "lightning": int(os.getenv("POLL_LIGHTNING_SECONDS", "600")),
+    "speed": int(os.getenv("POLL_SPEED_SECONDS", "600")),
+    "lightning": int(os.getenv("POLL_LIGHTNING_SECONDS", "300")),
 }
 # Extra minutes added to Apify lookback beyond the slowest due group's interval.
 LOOKBACK_BUFFER_MINUTES = int(os.getenv("LOOKBACK_BUFFER_MINUTES", "10"))
